@@ -17,7 +17,8 @@ def process_layout(img_path: str) -> List[Dict[str, Any]]:
         List[Dict[str, Any]]: A list of dictionaries containing the page number,
                               label, and bounding box for each detected element.
     """
-    layout_model = model_manager.layout_model
+    # Lazy load the model only when this function is actually called
+    layout_model = model_manager.initialize_layout_model()
     
     # Run layout detection
     try:

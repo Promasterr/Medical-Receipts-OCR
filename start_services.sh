@@ -25,15 +25,17 @@ else
     echo "Redis is already running."
 fi
 
-# Start Celery Worker for OCR (General tasks)
-# Concurrency 1 to prevent OOM
-echo "Starting Celery OCR Worker..."
+# Start Celery Worker for Batch OCR (GPU-bound, 1 concurrent)
+echo "Starting Celery Batch OCR Worker..."
+celery -A app.celery_app worker -Q batch_ocr -c 1 -n batch_ocr_worker --loglevel=info >> services.log 2>&1 &
+
+# Start Celery Worker for General OCR (General tasks)
+echo "Starting Celery General Worker..."
 celery -A app.celery_app worker -Q celery -c 1 -n ocr_worker --loglevel=info >> services.log 2>&1 &
 
-
-# Start Celery Worker for GPT (Strictly 1 at a time)
+# Start Celery Worker for GPT (I/O-bound, 20 concurrent)
 echo "Starting Celery GPT Worker..."
-celery -A app.celery_app worker -Q gpt_queue -c 1 -n gpt_worker --loglevel=info >> services.log 2>&1 &
+celery -A app.celery_app worker -Q gpt -c 20 -n gpt_worker --loglevel=info >> services.log 2>&1 &
 
 # Start Celery Beat for periodic cleanup
 echo "Starting Celery Beat..."
@@ -45,4 +47,5 @@ sleep 3
 # Start FastAPI
 echo "Starting FastAPI..."
 uvicorn app.main:app --host 0.0.0.0 --port 5000 --reload >> services.log 2>&1
+
 

@@ -508,3 +508,353 @@ def process_massara_ocr_task(self, pdf_path: str, original_filename: str, parent
         return asyncio.run(run_massara_ocr())
     except Exception as e:
         raise e
+
+
+# ============================================================================
+# BATCH PIPELINE TASKS - Buffered Inference Pattern
+# ============================================================================
+
+def save_interim_result(batch_id: str, pdf_name: str, ocr_data: dict) -> str:
+    """
+    Save OCR results to interim directory to avoid Celery blob problem.
+    
+    Args:
+        batch_id: Unique batch identifier
+        pdf_name: Name of the PDF (without extension)
+        ocr_data: Dictionary containing OCR text and metadata
+    
+    Returns:
+        Path to interim file
+    """
+    interim_file = os.path.join(
+        INTERIM_DIR,
+        batch_id,
+        f"{pdf_name}_ocr.json"
+    )
+    os.makedirs(os.path.dirname(interim_file), exist_ok=True)
+    
+    with open(interim_file, 'w') as f:
+        json.dump(ocr_data, f)
+    
+    return interim_file
+
+
+def group_results_by_pdf(result_map: dict) -> dict:
+    """
+    Group OCR results by PDF file.
+    
+    Args:
+        result_map: Dict mapping UUID to {metadata, result}
+    
+    Returns:
+        Dict mapping pdf_name to OCR data
+    """
+    pdf_groups = {}
+    
+    for uuid, data in result_map.items():
+        if data.get("skipped"):
+            continue
+            
+        metadata = data.get("metadata", {})
+        pdf_name = metadata.get("pdf_name")
+        
+        if not pdf_name:
+            continue
+        
+        if pdf_name not in pdf_groups:
+            pdf_groups[pdf_name] = {
+                "pages": [],
+                "pdf_path": metadata.get("pdf_path"),
+                "skipped_pages": []
+            }
+        
+        page_data = {
+            "page_num": metadata.get("page_num"),
+            "mode": metadata.get("mode"),
+            "text": data.get("result", "")
+        }
+        
+        if metadata.get("status") == "error":
+            pdf_groups[pdf_name]["skipped_pages"].append({
+                "page_num": metadata.get("page_num"),
+                "error": metadata.get("error")
+            })
+        else:
+            pdf_groups[pdf_name]["pages"].append(page_data)
+    
+    # Sort pages and join text
+    for pdf_name, group in pdf_groups.items():
+        group["pages"].sort(key=lambda x: x["page_num"])
+        
+        # Join text with separators based on mode
+        texts = []
+        for page in group["pages"]:
+            mode = page.get("mode", "")
+            if mode == "idcard":
+                separator = "============ ID Card ==========="
+            else:
+                separator = "===========page==========="
+            texts.append(f"{separator}\n{page['text']}")
+        
+        group["joined_text"] = "\n".join(texts)
+    
+    return pdf_groups
+
+
+@celery_app.task(
+    bind=True,
+    name="app.tasks.process_janzour_batch_pipeline",
+    soft_time_limit=7200,  # 2 hours
+    time_limit=9000,  # 2.5 hours
+    acks_late=True
+)
+def process_janzour_batch_pipeline(self, pdf_paths: list, batch_id: str):
+    """
+    Batch orchestrator task for Janzour template using buffered pipeline.
+    
+    This processes multiple PDFs with a true sliding window approach:
+    - Preprocessing streams results via async generator
+    - Inference maintains constant 16-image window in flight
+    - Results save to interim files (not passed through Celery)
+    - GPT extraction triggered per-PDF after OCR completes
+    """
+    
+    async def batch_orchestrator():
+        from app.core.document.janzour_processor import preprocess_pdf_async
+        from app.core.document.pdf_processor import run_buffered_batch_inference
+        
+        # Notify batch start
+        publish_update(batch_id, {
+            "batch_id": batch_id,
+            "status": "started",
+            "pdf_count": len(pdf_paths),
+            "template": "janzour",
+            "message": f"Starting batch processing of {len(pdf_paths)} PDFs (Janzour template)"
+        })
+        
+        # Stage 1: Create async preprocessing stream
+        async def preprocess_stream():
+            for pdf_path in pdf_paths:
+                interim_dir = os.path.join(INTERIM_DIR, batch_id)
+                async for job in preprocess_pdf_async(pdf_path, interim_dir):
+                    # Filter out skipped pages from inference
+                    if not job.get("skipped"):
+                        yield job
+        
+        # Stage 2: Buffered inference with true sliding window
+        result_map = {}
+        total_pages = 0
+        start_time = time.time()
+        
+        async for uuid, metadata, result in run_buffered_batch_inference(
+            preprocess_stream(),
+            max_concurrent=16
+        ):
+            total_pages += 1
+            result_map[uuid] = {
+                "metadata": metadata,
+                "result": result,
+                "skipped": metadata.get("status") in ["skipped", "error"]
+            }
+        
+        end_time = time.time()
+        total_duration = end_time - start_time
+        avg_per_page = total_duration / total_pages if total_pages > 0 else 0
+        
+        print("-" * 50)
+        print(f"✅ BATCH OCR COMPLETE ({total_pages} pages)")
+        print(f"⏱️ Total Time: {total_duration:.2f} seconds")
+        print(f"⚡ Avg Time Per Page: {avg_per_page:.2f} seconds/page")
+        print("-" * 50)
+        
+        # Stage 3: Group results by PDF
+        pdf_results = group_results_by_pdf(result_map)
+        
+        # Stage 4: Save interim results and trigger GPT extraction per PDF
+        for pdf_name, ocr_data in pdf_results.items():
+            # Save OCR text to interim file (prevents Celery blob)
+            interim_file = save_interim_result(batch_id, pdf_name, ocr_data)
+            
+            # Create individual task for this PDF
+            pdf_task_id = f"{batch_id}_{pdf_name}"
+            
+            # Trigger GPT extraction chain
+            chain(
+                process_gpt_extraction_from_file.s(
+                    interim_file,
+                    pdf_name,
+                    pdf_task_id,
+                    batch_id,
+                    template="janzour"
+                ),
+                process_validation_task.s(
+                    pdf_name,
+                    pdf_task_id,
+                    batch_id
+                )
+            ).apply_async(task_id=pdf_task_id)
+        
+        # Notify batch OCR complete
+        publish_update(batch_id, {
+            "batch_id": batch_id,
+            "status": "ocr_complete",
+            "processed_pdfs": len(pdf_results),
+            "total_pages": total_pages,
+            "total_time": total_duration,
+            "avg_time_per_page": avg_per_page,
+            "message": f"OCR complete for {len(pdf_results)} PDFs ({total_pages} pages) in {total_duration:.2f}s ({avg_per_page:.2f}s/page)"
+        })
+    
+    try:
+        asyncio.run(batch_orchestrator())
+    except Exception as e:
+        publish_update(batch_id, {
+            "batch_id": batch_id,
+            "status": "error",
+            "message": f"Batch processing failed: {str(e)}"
+        })
+        raise e
+
+
+@celery_app.task(
+    bind=True,
+    name="app.tasks.process_massara_batch_pipeline",
+    soft_time_limit=7200,
+    time_limit=9000,
+    acks_late=True
+)
+def process_massara_batch_pipeline(self, pdf_paths: list, batch_id: str):
+    """
+    Batch orchestrator task for Massara template using buffered pipeline.
+    """
+    
+    async def batch_orchestrator():
+        from app.core.document.massara_processor import preprocess_pdf_async
+        from app.core.document.pdf_processor import run_buffered_batch_inference
+        
+        publish_update(batch_id, {
+            "batch_id": batch_id,
+            "status": "started",
+            "pdf_count": len(pdf_paths),
+            "template": "massara",
+            "message": f"Starting batch processing of {len(pdf_paths)} PDFs (Massara template)"
+        })
+        
+        async def preprocess_stream():
+            for pdf_path in pdf_paths:
+                interim_dir = os.path.join(INTERIM_DIR, batch_id)
+                async for job in preprocess_pdf_async(pdf_path, interim_dir):
+                    if not job.get("skipped"):
+                        yield job
+        
+        # Stage 2: Buffered inference with true sliding window
+        result_map = {}
+        total_pages = 0
+        start_time = time.time()
+        
+        async for uuid, metadata, result in run_buffered_batch_inference(
+            preprocess_stream(),
+            max_concurrent=16
+        ):
+            total_pages += 1
+            result_map[uuid] = {
+                "metadata": metadata,
+                "result": result,
+                "skipped": metadata.get("status") in ["skipped", "error"]
+            }
+            
+        end_time = time.time()
+        total_duration = end_time - start_time
+        avg_per_page = total_duration / total_pages if total_pages > 0 else 0
+        
+        print("-" * 50)
+        print(f"✅ BATCH OCR COMPLETE ({total_pages} pages)")
+        print(f"⏱️ Total Time: {total_duration:.2f} seconds")
+        print(f"⚡ Avg Time Per Page: {avg_per_page:.2f} seconds/page")
+        print("-" * 50)
+        
+        # Stage 3: Group results by PDF
+        pdf_results = group_results_by_pdf(result_map)
+        
+        # Stage 4: Save interim results and trigger GPT extraction per PDF
+        for pdf_name, ocr_data in pdf_results.items():
+            # Save OCR text to interim file (prevents Celery blob)
+            interim_file = save_interim_result(batch_id, pdf_name, ocr_data)
+            
+            # Create individual task for this PDF
+            pdf_task_id = f"{batch_id}_{pdf_name}"
+            
+            # Trigger GPT extraction chain
+            chain(
+                process_gpt_extraction_from_file.s(
+                    interim_file,
+                    pdf_name,
+                    pdf_task_id,
+                    batch_id,
+                    template="massara"
+                ),
+                process_validation_task.s(
+                    pdf_name,
+                    pdf_task_id,
+                    batch_id
+                )
+            ).apply_async(task_id=pdf_task_id)
+        
+        # Notify batch OCR complete
+        publish_update(batch_id, {
+            "batch_id": batch_id,
+            "status": "ocr_complete",
+            "processed_pdfs": len(pdf_results),
+            "total_pages": total_pages,
+            "total_time": total_duration,
+            "avg_time_per_page": avg_per_page,
+            "message": f"OCR complete for {len(pdf_results)} PDFs ({total_pages} pages) in {total_duration:.2f}s ({avg_per_page:.2f}s/page)"
+        })
+    
+    try:
+        asyncio.run(batch_orchestrator())
+    except Exception as e:
+        publish_update(batch_id, {
+            "batch_id": batch_id,
+            "status": "error",
+            "message": f"Batch processing failed: {str(e)}"
+        })
+        raise e
+
+
+@celery_app.task(bind=True, name="app.tasks.process_gpt_extraction_from_file")
+def process_gpt_extraction_from_file(self, interim_file: str, original_filename: str, parent_task_id: str, batch_id: str = None, template: str = None):
+    """
+    Modified GPT extraction that reads from interim file instead of receiving data via Celery.
+    This prevents the Celery blob problem.
+    """
+    task_id = parent_task_id
+    
+    # Load OCR data from file
+    with open(interim_file, 'r') as f:
+        ocr_data = json.load(f)
+    
+    text = ocr_data.get("joined_text", "")
+    skipped_pages = ocr_data.get("skipped_pages", [])
+    
+    # Collect image paths
+    interim_dir = os.path.dirname(interim_file)
+    image_paths = []
+    if os.path.exists(interim_dir):
+        for root, dirs, files in os.walk(interim_dir):
+            for file in files:
+                if file.lower().endswith(('.png', '.jpg', '.jpeg')):
+                    image_paths.append(os.path.join(root, file))
+        image_paths.sort()
+    
+    # Reuse existing GPT extraction logic
+    ocr_result = {
+        "text": text,
+        "skipped": skipped_pages,
+        "pdf_path": ocr_data.get("pdf_path", ""),
+        "image_paths": image_paths
+    }
+    
+    # Call existing GPT extraction task logic
+    return process_gpt_extraction(ocr_result, original_filename, parent_task_id, batch_id, template)
+

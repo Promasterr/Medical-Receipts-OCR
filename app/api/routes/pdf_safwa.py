@@ -42,11 +42,9 @@ async def process_safwa_pdf(file: UploadFile = File(...)):
 @router.post("/batch-process-pdf/safwa/")
 async def batch_process_safwa_pdf(files: List[UploadFile] = File(...)):
     """
-    Submit multiple PDFs for Safwa template processing.
+    Submit multiple PDFs for Safwa template batch processing using buffered pipeline.
     Safwa uses the same processing logic as Janzour.
     """
-    results = []
-    
     # Filter valid files first
     valid_files = [f for f in files if f.filename.lower().endswith(".pdf")]
     
@@ -55,11 +53,8 @@ async def batch_process_safwa_pdf(files: List[UploadFile] = File(...)):
         
     batch_id = str(uuid.uuid4())
     
-    # Initialize batch counter in Redis
-    redis = aioredis.from_url(settings.REDIS_URL, decode_responses=True)
-    await redis.set(f"batch_count:{batch_id}", len(valid_files))
-    await redis.close()
-    
+    # Save all PDFs first
+    pdf_paths = []
     for file in valid_files:
         task_id = str(uuid.uuid4())
         file_id = f"{task_id}_{file.filename}"
@@ -67,18 +62,26 @@ async def batch_process_safwa_pdf(files: List[UploadFile] = File(...)):
         
         with open(file_path, "wb") as buffer:
             shutil.copyfileobj(file.file, buffer)
-            
-        process_janzour_pipeline.apply_async(
-            args=[os.path.abspath(file_path), file.filename, batch_id],
-            task_id=task_id
-        )
         
-        results.append({
-            "task_id": task_id, 
-            "filename": file.filename, 
-            "status": "queued",
-            "batch_id": batch_id,
-            "template": "safwa"
-        })
-        
-    return results
+        pdf_paths.append(os.path.abspath(file_path))
+    
+    # Initialize batch counter in Redis
+    redis = aioredis.from_url(settings.REDIS_URL, decode_responses=True)
+    await redis.set(f"batch_count:{batch_id}", len(valid_files))
+    await redis.close()
+    
+    # Trigger SINGLE batch orchestrator task
+    from app.tasks import process_janzour_batch_pipeline
+    process_janzour_batch_pipeline.apply_async(
+        args=[pdf_paths, batch_id],
+        task_id=batch_id
+    )
+    
+    return {
+        "batch_id": batch_id,
+        "pdf_count": len(pdf_paths),
+        "status": "processing",
+        "template": "safwa",
+        "message": f"Batch processing started for {len(pdf_paths)} PDFs using buffered pipeline"
+    }
+

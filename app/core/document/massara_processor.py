@@ -127,6 +127,7 @@ async def prepare_massara_page(image_path: str) -> Optional[Dict]:
                 input_image_cv, qr_detections, image_bboxes,
                 expansion_factor_up=4.0, expansion_factor_right=5.8,
             )
+            cv2.imwrite("cv_image.jpg", cropped_cv)
             if cropped_cv is not None:
                 final_image = Image.fromarray(cv2.cvtColor(cropped_cv, cv2.COLOR_BGR2RGB))
                 keyword = "idcard"
@@ -158,6 +159,76 @@ async def prepare_massara_page(image_path: str) -> Optional[Dict]:
         "mode": mode,
         "original_path": image_path,
     }
+
+
+import uuid
+
+async def preprocess_pdf_async(pdf_path: str, temp_dir: str):
+    """
+    Async generator that yields preprocessed Massara images one at a time.
+    
+    This streams preprocessing results to enable the buffered pipeline pattern
+    instead of preprocessing all pages before starting inference.
+    
+    Args:
+        pdf_path: Path to PDF file
+        temp_dir: Temporary directory for intermediate files
+    
+    Yields:
+        Dict containing:
+            - uuid: Unique identifier for this page
+            - image: Preprocessed PIL Image
+            - prompt: OCR prompt string
+            - metadata: Dict with pdf_path, page_num, mode, pdf_name
+    """
+    from pathlib import Path
+    pdf_name = Path(pdf_path).stem
+    pdf_images_dir = os.path.join(temp_dir, f"{pdf_name}_images")
+    os.makedirs(pdf_images_dir, exist_ok=True)
+
+    # Extract all images first (this is fast, CPU-bound)
+    extracted_images = extract_images_from_pdf(pdf_path, pdf_images_dir)
+    
+    # Yield preprocessed images one at a time
+    for idx, image_path in enumerate(extracted_images):
+        try:
+            job = await prepare_massara_page(image_path)
+            if job:
+                # Add UUID and metadata
+                job["uuid"] = str(uuid.uuid4())
+                job["metadata"] = {
+                    "pdf_path": pdf_path,
+                    "pdf_name": pdf_name,
+                    "page_num": idx,
+                    "mode": job.get("mode", "massara")
+                }
+                yield job
+            else:
+                # Yield a skip marker
+                yield {
+                    "uuid": str(uuid.uuid4()),
+                    "metadata": {
+                        "pdf_path": pdf_path,
+                        "pdf_name": pdf_name,
+                        "page_num": idx,
+                        "status": "skipped"
+                    },
+                    "skipped": True
+                }
+        except Exception as e:
+            # Yield error marker
+            yield {
+                "uuid": str(uuid.uuid4()),
+                "metadata": {
+                    "pdf_path": pdf_path,
+                    "pdf_name": pdf_name,
+                    "page_num": idx,
+                    "error": str(e),
+                    "status": "error"
+                },
+                "skipped": True
+            }
+
 
 
 async def process_massara_pdf(pdf_path: str, temp_dir: str, progress_callback=None):

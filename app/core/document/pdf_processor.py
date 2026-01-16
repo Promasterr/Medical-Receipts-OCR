@@ -793,51 +793,84 @@ def remove_barcode(img, expand_w=0.1, expand_h=0.4):
     return output_img
 
 def get_finder_patterns(cropped_qr_image):
-    if cropped_qr_image.size == 0:
-        return []
+    if cropped_qr_image.size == 0: return []
+    
     gray = cv2.cvtColor(cropped_qr_image, cv2.COLOR_BGR2GRAY)
     _, binary = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
-    contours, _ = cv2.findContours(binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     
-    pattern_centers = []
-    for contour in contours:
-        perimeter = cv2.arcLength(contour, True)
-        approx = cv2.approxPolyDP(contour, 0.04 * perimeter, True)
-        area = cv2.contourArea(contour)
-        if len(approx) == 4 and area > 100:
-            x, y, w, h = cv2.boundingRect(contour)
-            if 0.8 < w/h < 1.2:
-                M = cv2.moments(contour)
-                if M["m00"] != 0:
-                    cX = int(M["m10"] / M["m00"])
-                    cY = int(M["m01"] / M["m00"])
-                    pattern_centers.append((cX, cY))
-    return pattern_centers
+    # RETR_TREE retrieves all contours and reconstructs a full hierarchy
+    contours, hierarchy = cv2.findContours(binary, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
+    
+    if hierarchy is None: return []
+    hierarchy = hierarchy[0]
+    
+    found_centers = []
+    for i in range(len(contours)):
+        k = i
+        count = 0
+        # Follow the 'child' link in the hierarchy
+        while hierarchy[k][2] != -1:
+            k = hierarchy[k][2]
+            count += 1
+        
+        # A QR finder pattern has 2 nested children (3 squares total)
+        if count >= 2:
+            M = cv2.moments(contours[i])
+            if M["m00"] != 0:
+                cX = int(M["m10"] / M["m00"])
+                cY = int(M["m01"] / M["m00"])
+                found_centers.append((cX, cY))
 
-def determine_orientation(pattern_centers):
-    if len(pattern_centers) < 3:
-        return 0
-    y_coords = sorted([p[1] for p in pattern_centers])
-    
-    # Robust logic: Find the largest vertical gap to separate "top" and "bottom" groups
-    max_gap = 0
-    split_index = 0
-    for i in range(len(y_coords) - 1):
-        gap = y_coords[i+1] - y_coords[i]
-        if gap > max_gap:
-            max_gap = gap
-            split_index = i
+    # Remove duplicates (sometimes multiple contours represent the same pattern)
+    unique_centers = []
+    for c in found_centers:
+        if all(np.linalg.norm(np.array(c) - np.array(u)) > 10 for u in unique_centers):
+            unique_centers.append(c)
             
-    # Points with smaller Y (above gap) are "top" group
-    # Points with larger Y (below gap) are "bottom" group
-    count_top = split_index + 1
-    count_bottom = len(y_coords) - (split_index + 1)
+    return unique_centers
+
+def determine_orientation(pts):
+    if len(pts) < 3: return 0
+    pts = pts[:3]
     
-    print(f"DEBUG: determine_orientation: y_coords={y_coords}, max_gap={max_gap}, top={count_top}, bottom={count_bottom}")
+    # 1. Identify the corner vertex (V) 
+    # It's the point where the two legs meet (not the hypotenuse)
+    d01 = np.linalg.norm(np.array(pts[0]) - np.array(pts[1]))
+    d12 = np.linalg.norm(np.array(pts[1]) - np.array(pts[2]))
+    d20 = np.linalg.norm(np.array(pts[2]) - np.array(pts[0]))
     
-    # 0 degrees: 2 finders at top, 1 at bottom (more at top)
-    # 180 degrees: 1 finder at top, 2 at bottom (more at bottom)
-    return 0 if count_top > count_bottom else 180
+    distances = [d01, d12, d20]
+    max_idx = np.argmax(distances)
+    
+    # The vertex is the point NOT involved in the longest side (hypotenuse)
+    if max_idx == 0: v_idx, p1_idx, p2_idx = 2, 0, 1
+    elif max_idx == 1: v_idx, p1_idx, p2_idx = 0, 1, 2
+    else: v_idx, p1_idx, p2_idx = 1, 0, 2
+    
+    v = np.array(pts[v_idx])
+    p1 = np.array(pts[p1_idx])
+    p2 = np.array(pts[p2_idx])
+    
+    # 2. Define the two leg vectors
+    vec1 = p1 - v
+    vec2 = p2 - v
+    
+    # Determine which vector is "Horizontal" and which is "Vertical"
+    # In a 0-degree QR, one vector points Right (+X) and one points Down (+Y)
+    
+    # Calculate the angle of the "average" vector from the vertex
+    mean_vec = vec1 + vec2
+    angle = np.degrees(np.arctan2(mean_vec[1], mean_vec[0]))
+    
+    # Map the angle of the "mouth" of the L-shape to rotation
+    # (Using 45-degree offsets to handle slight tilts)
+    if 0 <= angle < 90:    return 0    # Points Bottom-Right
+    if 90 <= angle < 180:  return 90   # Points Bottom-Left
+    if -180 <= angle < -90: return 180 # Points Top-Left
+    if -90 <= angle < 0:    return 270 # Points Top-Right
+    
+    return 0
+
 
 def predict_qr_detection(image):
     qr_detector = model_manager.initialize_qr_detector()
@@ -852,60 +885,88 @@ def process_and_crop_qr_region(image, detections, image_bboxes, expansion_factor
     target_detection = detections[0]
     x1, y1, x2, y2 = map(int, target_detection['bbox_xyxy'])
     
+    # Crop QR region to find patterns
     cropped_image_qr = image[y1:y2, x1:x2]
     if cropped_image_qr.size > 0:
         pattern_centers_local = get_finder_patterns(cropped_image_qr)
         if len(pattern_centers_local) >= 3:
             orientation_angle = determine_orientation(pattern_centers_local)
            
-    # Apply rotation
+    print(f"DEBUG: Detected orientation angle: {orientation_angle}")
+    
+    # Apply rotation correction
     rotated_image = image.copy()
+    w_rot, h_rot = w_orig, h_orig
     
-    if orientation_angle == 180:
-        print("rotating image")
+    if orientation_angle == 90:
+        print("Rotating image 90 CCW (Correcting 90 CW)")
+        rotated_image = cv2.rotate(rotated_image, cv2.ROTATE_90_COUNTERCLOCKWISE)
+        w_rot, h_rot = h_orig, w_orig
+    elif orientation_angle == 180:
+        print("Rotating image 180")
         rotated_image = cv2.rotate(rotated_image, cv2.ROTATE_180)
+    elif orientation_angle == 270:
+        print("Rotating image 90 CW (Correcting 270 CW)")
+        rotated_image = cv2.rotate(rotated_image, cv2.ROTATE_90_CLOCKWISE)
+        w_rot, h_rot = h_orig, w_orig
         
-    h_rot, w_rot = rotated_image.shape[:2]
+    # Helper to rotate points
+    def rotate_point(px, py, angle, w, h):
+        """Map point (px, py) from original (w,h) to rotated space"""
+        if angle == 90: # CCW
+            return py, w - px
+        elif angle == 180:
+            return w - px, h - py
+        elif angle == 270: # CW
+            return h - py, px
+        return px, py
+
+    # Transform QR bbox to rotated space
+    rx1, ry1 = rotate_point(x1, y1, orientation_angle, w_orig, h_orig)
+    rx2, ry2 = rotate_point(x2, y2, orientation_angle, w_orig, h_orig)
     
-    # Transform QR bbox for cropping (in rotated coordinates)
-    if orientation_angle == 180:
-        x1r = w_orig - x2
-        y1r = h_orig - y2
-        x2r = w_orig - x1
-        y2r = h_orig - y1
-        x1, x2 = min(x1r, x2r), max(x1r, x2r)
-        y1, y2 = min(y1r, y2r), max(y1r, y2r)
-        
-    w_box = x2 - x1
-    h_box = y2 - y1
+    # Normalize min/max after rotation
+    qx1, qx2 = min(rx1, rx2), max(rx1, rx2)
+    qy1, qy2 = min(ry1, ry2), max(ry1, ry2)
     
-    y1_final = max(0, int(y2 - h_box * expansion_factor_up))
-    x2_final = min(w_rot, int(x1 + w_box * expansion_factor_right))
-    x1_final = max(0, x1)
-    y2_final = min(h_rot, y2)
+    w_box = qx2 - qx1
+    h_box = qy2 - qy1
+    
+    # Calculate expansion in rotated space
+    y1_final = max(0, int(qy2 - h_box * expansion_factor_up))
+    x2_final = min(w_rot, int(qx1 + w_box * expansion_factor_right))
+    x1_final = max(0, qx1)
+    y2_final = min(h_rot, qy2)
     
     expanded_area = (x2_final - x1_final) * (y2_final - y1_final)
 
-    # Whiten image bboxes
+    # Whiten image bboxes (mapped to rotated space)
     for item in image_bboxes:
         bx1, by1, bx2, by2 = map(int, item["bbox"])
-        if orientation_angle == 180:
-            bx1r = w_orig - bx2
-            by1r = h_orig - by2
-            bx2r = w_orig - bx1
-            by2r = h_orig - by1
-            bx1, bx2 = min(bx1r, bx2r), max(bx1r, bx2r)
-            by1, by2 = min(by1r, by2r), max(by1r, by2r)
         
-        bx1 = max(0, bx1)
-        by1 = max(0, by1)
-        bx2 = min(w_rot, bx2)
-        by2 = min(h_rot, by2)
+        # Transform all 4 corners to be safe, then get bbox
+        corners = [
+            rotate_point(bx1, by1, orientation_angle, w_orig, h_orig),
+            rotate_point(bx2, by1, orientation_angle, w_orig, h_orig),
+            rotate_point(bx2, by2, orientation_angle, w_orig, h_orig),
+            rotate_point(bx1, by2, orientation_angle, w_orig, h_orig)
+        ]
         
-        item_area = (bx2 - bx1) * (by2 - by1)
-        # Check size before whitening: skip if item is larger than half the expanded region
+        rbx1 = min(c[0] for c in corners)
+        rbx2 = max(c[0] for c in corners)
+        rby1 = min(c[1] for c in corners)
+        rby2 = max(c[1] for c in corners)
+        
+        rbx1 = max(0, int(rbx1))
+        rby1 = max(0, int(rby1))
+        rbx2 = min(w_rot, int(rbx2))
+        rby2 = min(h_rot, int(rby2))
+        
+        item_area = (rbx2 - rbx1) * (rby2 - rby1)
+        
+        # Check size before whitening
         if item_area < 0.3 * expanded_area:
-            rotated_image[by1:by2, bx1:bx2] = 255
+            rotated_image[rby1:rby2, rbx1:rbx2] = 255
     
     cropped_final = rotated_image[y1_final:y2_final, x1_final:x2_final]
     cv2.imwrite('idcard.png', cropped_final)
@@ -1164,6 +1225,76 @@ async def run_batch_inference(batch_jobs: List[Dict], max_new_tokens: int = 8192
             results.append(result)
     
     return results
+
+
+async def _run_single_inference_task_with_metadata(
+    job: Dict,
+    semaphore: asyncio.Semaphore,
+    max_new_tokens: int = 11000
+) -> tuple[str, Dict, Union[str, Exception]]:
+    """
+    Run single inference with semaphore control and metadata preservation.
+    
+    Args:
+        job: Job dict containing uuid, image, prompt, and metadata
+        semaphore: Asyncio semaphore for concurrency control
+        max_new_tokens: Maximum tokens for generation
+    
+    Returns:
+        (uuid, metadata, result) tuple
+    """
+    async with semaphore:
+        result = await _run_single_inference_task(job, max_new_tokens)
+        return job["uuid"], job["metadata"], result
+
+
+async def run_buffered_batch_inference(
+    image_iterator,
+    max_concurrent: int = 16
+):
+    """
+    True sliding window inference - keeps exactly N images in flight at all times.
+    
+    This implements a producer-consumer pattern where:
+    - Images are preprocessed asynchronously (producer)
+    - A fixed window of N tasks run concurrently (consumer)
+    - Tasks complete individually (no batching delays)
+    - GPU utilization remains constant
+    
+    Args:
+        image_iterator: Async generator yielding preprocessed image jobs
+        max_concurrent: Maximum concurrent inference tasks (GPU capacity)
+    
+    Yields:
+        (uuid, metadata, ocr_result) tuples as they complete
+    """
+    semaphore = asyncio.Semaphore(max_concurrent)
+    tasks = set()
+    
+    async for job in image_iterator:
+        # Wait for a task to complete if we hit the limit
+        if len(tasks) >= max_concurrent:
+            done, tasks = await asyncio.wait(
+                tasks,
+                return_when=asyncio.FIRST_COMPLETED
+            )
+            # Yield completed results immediately
+            for task in done:
+                uuid, metadata, result = task.result()
+                yield uuid, metadata, result
+        
+        # Add new task to the sliding window
+        task = asyncio.create_task(
+            _run_single_inference_task_with_metadata(job, semaphore)
+        )
+        tasks.add(task)
+    
+    # Clean up remaining tasks after iteration completes
+    if tasks:
+        results = await asyncio.gather(*tasks)
+        for uuid, metadata, result in results:
+            yield uuid, metadata, result
+
 
 
 async def process_single_pdf_batched(pdf_path: str, temp_dir: str, max_new_tokens: int = 8192):
