@@ -4,10 +4,26 @@ from app.config import settings
 from app.models.ml_models import model_manager
 
 @worker_process_init.connect
-def init_models(**kwargs):
-    print("🤖 Worker process initializing... Models will be lazy-loaded on demand.")
-    # Removed explicit initialize_all() to prevents OOM in GPT workers
-    # model_manager.initialize_all()
+def init_models(sender=None, **kwargs):
+    """
+    Initialize models selectively based on worker type.
+    - 'batch_ocr' workers: Preload layout model (GPU)
+    - 'gpt' workers: Do NOT load layout model (save RAM/VRAM)
+    - 'celery' (default) workers: Lazy load
+    """
+    worker_hostname = sender.hostname if sender else ""
+    print(f"🤖 Worker initializing: {worker_hostname}")
+    
+    # Check if this is a heavy batch OCR worker
+    if "batch_ocr" in worker_hostname:
+        print("🚀 Pre-loading Layout Model for Batch Worker...")
+        try:
+            model_manager.initialize_layout_model()
+            model_manager.initialize_vllm_client()
+        except Exception as e:
+            print(f"⚠️ Failed to preload models: {e}")
+    else:
+        print("zzz Skipping model preload (Lazy Loading mode)")
 
 
 celery_app = Celery(
@@ -54,8 +70,8 @@ celery_app.conf.update(
 # 
 # To start workers with optimized concurrency:
 #
-# # Batch OCR worker (GPU-bound, 1 concurrent task)
-# celery -A app.celery_app worker -Q batch_ocr -c 1 --loglevel=info
+# # Batch OCR worker (GPU-bound, 2 concurrent tasks)
+# celery -A app.celery_app worker -Q batch_ocr -c 2 --loglevel=info
 #
 # # GPT extraction worker (I/O-bound, 20 concurrent tasks)
 # celery -A app.celery_app worker -Q gpt -c 20 --loglevel=info

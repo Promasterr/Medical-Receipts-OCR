@@ -10,6 +10,10 @@ from huggingface_hub import snapshot_download
 from app.config import settings
 import os
 
+# Set PaddlePaddle memory flags to avoid OOM by enabling auto-growth
+os.environ["FLAGS_allocator_strategy"] = "auto_growth"
+os.environ["FLAGS_fraction_of_gpu_memory_to_use"] = "0.2"
+
 
 class ModelManager:
     """Singleton class to manage all ML models"""

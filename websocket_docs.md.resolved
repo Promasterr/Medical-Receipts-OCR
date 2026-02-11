@@ -1,0 +1,80 @@
+# WebSocket API Documentation
+
+The OCR pipeline uses a WebSocket endpoint at `ws://<host>/ws` to provide real-time status updates during document processing. Updates are broadcast from Celery tasks via Redis Pub/Sub.
+
+## Connection
+- **Endpoint**: `/ws`
+- **Protocol**: `ws` or `wss`
+- **Subscription**: The server automatically subscribes the connection to all task updates (`task_updates:*`).
+
+---
+
+## Message Structure
+All messages are JSON objects following this standard structure:
+
+```json
+{
+  "task_id": "uuid-string",
+  "filename": "original-filename.pdf",
+  "batch_id": "uuid-string (optional)",
+  "message": "human-readable-message (optional)",
+  "event": "event-type",
+  "data": {
+    "result": { ... parsed JSON object ... },
+    "raw_text": "...",
+    "validation_review": "...",
+    "skipped": "..."
+  }
+}
+```
+
+---
+
+## Event Types
+
+### 1. `started`
+Sent when a document processing pipeline begins.
+- **Fields**: `task_id`, `filename`, `batch_id`, `status: "started"`, `message`.
+
+### 2. [progress](file:///home/user/ocrscript/app/tasks.py#28-42)
+Sent during various stages of processing (Image Extraction, Preprocessing, OCR, GPT Inference, Validation).
+- **Structure**:
+```json
+{
+  "event": "progress",
+  "data": {
+    "step": "step_name",
+    "message": "Current activity description",
+    "pages": 0,          // Total pages (if applicable)
+    "status": "done",    // Status of this specific step
+    "prepared_pages": 0, // Count of pages ready for OCR
+    "skipped_pages": 0    // Count of pages skipped during preprocessing
+  }
+}
+```
+- **Step Names**: [extract_images](file:///home/user/ocrscript/app/core/document/pdf_processor.py#633-660), `preprocessing`, [ocr](file:///home/user/ocrscript/app/tasks.py#81-118), `gpt_start`, [validation](file:///home/user/ocrscript/app/tasks.py#244-329).
+
+### 3. `step_completed`
+Sent when a major processing block (like GPT extraction) finishes but more work (like validation) remains.
+- **Data**: `{"step": "extraction", "message": "..."}`
+
+### 4. `completed`
+Sent when the entire pipeline for a single document is finished.
+- **Data**: Contains the final `result` object, `raw_text`, `skipped` pages, and `validation_review`.
+
+### 5. `batch_completed`
+Sent when all documents in a batch have finished processing.
+- **Top-level**: `event: "batch_completed"`, `batch_id`, `message`.
+
+### 6. `error`
+Sent when a task fails.
+- **Top-level**: `event: "error"`, `message`.
+
+---
+
+## Example Flow (Single Document)
+1. `{"status": "started", "message": "Started processing document.pdf"}`
+2. `{"event": "progress", "data": {"step": "extract_images", "message": "..."}}`
+3. `{"event": "progress", "data": {"step": "ocr", "message": "..."}}`
+4. `{"event": "step_completed", "data": {"step": "extraction", ...}}`
+5. `{"event": "completed", "data": { ... final JSON ... }}`

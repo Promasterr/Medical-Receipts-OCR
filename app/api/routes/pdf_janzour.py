@@ -32,6 +32,7 @@ async def process_janzour_pdf(file: UploadFile = File(...)):
     # Launch Celery Task for Janzour
     task = process_janzour_pipeline.apply_async(
         args=[os.path.abspath(file_path), file.filename],
+        kwargs={"template": "janzour"},
         task_id=task_id
     )
     
@@ -72,6 +73,7 @@ async def batch_process_janzour_pdf(files: List[UploadFile] = File(...)):
     from app.tasks import process_janzour_batch_pipeline
     process_janzour_batch_pipeline.apply_async(
         args=[pdf_paths, batch_id],
+        kwargs={"template": "janzour"},
         task_id=batch_id
     )
     

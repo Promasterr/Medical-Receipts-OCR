@@ -33,6 +33,7 @@ async def process_muasafat_pdf(file: UploadFile = File(...)):
     # Launch Celery Task (uses Massara pipeline)
     task = process_massara_pipeline.apply_async(
         args=[os.path.abspath(file_path), file.filename],
+        kwargs={"template": "muasafat"},
         task_id=task_id
     )
     
@@ -74,6 +75,7 @@ async def batch_process_muasafat_pdf(files: List[UploadFile] = File(...)):
     from app.tasks import process_massara_batch_pipeline
     process_massara_batch_pipeline.apply_async(
         args=[pdf_paths, batch_id],
+        kwargs={"template": "muasafat"},
         task_id=batch_id
     )
     

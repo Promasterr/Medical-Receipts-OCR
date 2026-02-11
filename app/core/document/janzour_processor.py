@@ -24,7 +24,7 @@ from app.core.document.pdf_processor import (
 )
 
 
-async def prepare_janzour_page(image_path: str) -> Optional[Dict]:
+async def prepare_janzour_page(image_path: str, save_path: Optional[str] = None) -> Optional[Dict]:
     """
     Prepare input for a single page using Janzour template logic.
     Includes ID card detection as fallback.
@@ -40,6 +40,7 @@ async def prepare_janzour_page(image_path: str) -> Optional[Dict]:
 
     try:
         results = process_layout(image_path)
+        print(f"prepare_janzour_page: results: {results}")
     except Exception as e:
         print(f"prepare_janzour_page: layout error for {image_path}: {e}")
         return None
@@ -48,6 +49,7 @@ async def prepare_janzour_page(image_path: str) -> Optional[Dict]:
     doc_title = next((item for item in results if item["label"] == "doc_title"), None)
     footer = next((item for item in results if item["label"] == "footer"), None)
     paragraph_title = next((item for item in results if item["label"] == "paragraph_title"), None)
+    figure_title = next((item for item in results if item["label"] == "figure_title"), None)
     has_table = any(item["label"] == "table" for item in results)
     has_header = any(item["label"] in ("header", "header_image") for item in results)
     
@@ -70,20 +72,75 @@ async def prepare_janzour_page(image_path: str) -> Optional[Dict]:
                 # Run OCR to check the title
                 ocr_result = await _run_single_inference_task(ocr_job, max_new_tokens=512)
                 print(f"prepare_janzour_page: ocr_result: {ocr_result}")
-                if "إيصال" in ocr_result and "رقم" in ocr_result:
-                    keyword="janzour"
-                    mode="janzour"
-                    img = cv2.imread(image_path)
-                    final_image = Image.fromarray(cv2.cvtColor(img, cv2.COLOR_BGR2RGB))
+                
+                if isinstance(ocr_result, str):
+                    if "إيصال" in ocr_result and "رقم" in ocr_result:
+                        keyword="janzour"
+                        mode="janzour"
+                        img = cv2.imread(image_path)
+                        final_image = Image.fromarray(cv2.cvtColor(img, cv2.COLOR_BGR2RGB))
+                    elif "كشف تفاصيل الخدمات" in ocr_result:
+                        cropped = crop_below_bbox(image_path, paragraph_title["bbox"])
+                        cropped = remove_barcode(cropped)
+                        final_image = cropped
+                        if footer is not None:
+                            final_image = crop_from_upper(final_image, footer["bbox"])
                 else:
-                    print(f"prepare_janzour_page: skip (paragraph_title OCR check failed) — {image_path}")
+                    print(f"prepare_janzour_page: OCR failed or returned non-string result: {ocr_result}")
                     return None
             except Exception as e:
                 print(f"prepare_janzour_page: OCR error on doc_title: {e}")
                 return None
-        else:
-            # Fall through to check for ID card
-            pass
+        elif figure_title is not None:
+            try:
+                crop = crop_region_from_image(image_path, figure_title["bbox"])
+        
+                # Perform OCR on the cropped doc_title
+                ocr_job = {
+                    "image": crop,
+                    "prompt": "extract the arabic text"
+                }
+            
+                ocr_result = await _run_single_inference_task(ocr_job, max_new_tokens=512)
+                print(f"prepare_janzour_page: ocr_result: {ocr_result}")
+                
+                if isinstance(ocr_result, str):
+                    if "إيصال" in ocr_result and "رقم" in ocr_result:
+                        keyword="janzour"
+                        mode="janzour"
+                        img = cv2.imread(image_path)
+                        final_image = Image.fromarray(cv2.cvtColor(img, cv2.COLOR_BGR2RGB))
+                        pass
+                    else:
+                        qr_detections = predict_qr_detection(input_image_cv)
+                        if len(qr_detections) > 0:
+                            print(f"prepare_janzour_page: idcard detected for {image_path}")
+                            image_bboxes = [
+                                {
+                                    "label": item["label"],
+                                    "bbox": item["bbox"],
+                                }
+                                for item in results if item["label"] == "image"
+                            ]
+                            cropped_cv = process_and_crop_qr_region(
+                                input_image_cv, qr_detections, image_bboxes,
+                                expansion_factor_up=4.0, expansion_factor_right=5.8,
+                            )
+                            if cropped_cv is not None:
+                                final_image = Image.fromarray(cv2.cvtColor(cropped_cv, cv2.COLOR_BGR2RGB))
+                                keyword = "idcard"
+                                mode = "idcard"
+                            else:
+                                return None
+                        else:
+                            print(f"prepare_janzour_page: skip (figure_title OCR check failed) — {image_path}")
+                            return None
+                else:
+                    print(f"prepare_janzour_page: OCR failed or returned non-string result: {ocr_result}")
+                    return None
+            except Exception as e:
+                print(f"prepare_janzour_page: OCR error on figure_title: {e}")
+                return None
 
     if (not has_table) and has_header:
         qr_detections = predict_qr_detection(input_image_cv)
@@ -150,6 +207,13 @@ async def prepare_janzour_page(image_path: str) -> Optional[Dict]:
 
     prompt = get_prompt_by_keyword(keyword)
 
+    # Save the processed image if requested
+    processed_path = None
+    if save_path and final_image:
+        os.makedirs(os.path.dirname(save_path), exist_ok=True)
+        final_image.save(save_path, format="JPEG")
+        processed_path = save_path
+
     # Safety check: ensure we have a valid image before returning
     if final_image is None:
         print(f"prepare_janzour_page: skip (no valid image generated) — {image_path}")
@@ -160,6 +224,7 @@ async def prepare_janzour_page(image_path: str) -> Optional[Dict]:
         "prompt": prompt,
         "mode": mode,
         "original_path": image_path,
+        "processed_path": processed_path
     }
 
 
@@ -184,7 +249,14 @@ async def preprocess_pdf_async(pdf_path: str, temp_dir: str):
             - metadata: Dict with pdf_path, page_num, mode, pdf_name
     """
     from pathlib import Path
-    pdf_name = Path(pdf_path).stem
+    full_stem = Path(pdf_path).stem
+    # The file_id is constructed as {task_id}_{original_filename} in routes
+    # UUID is 36 chars, plus underscore = 37 chars prefix
+    if len(full_stem) > 37 and full_stem[36] == '_':
+        pdf_name = full_stem[37:]
+    else:
+        pdf_name = full_stem
+
     pdf_images_dir = os.path.join(temp_dir, f"{pdf_name}_images")
     os.makedirs(pdf_images_dir, exist_ok=True)
 
@@ -194,7 +266,11 @@ async def preprocess_pdf_async(pdf_path: str, temp_dir: str):
     # Yield preprocessed images one at a time
     for idx, image_path in enumerate(extracted_images):
         try:
-            job = await prepare_janzour_page(image_path)
+            # Construct a path for the processed/cropped image
+            processed_name = f"page_{idx+1}_processed.jpg"
+            save_path = os.path.join(pdf_images_dir, processed_name)
+
+            job = await prepare_janzour_page(image_path, save_path=save_path)
             if job:
                 # Add UUID and metadata
                 job["uuid"] = str(uuid.uuid4())
@@ -202,7 +278,8 @@ async def preprocess_pdf_async(pdf_path: str, temp_dir: str):
                     "pdf_path": pdf_path,
                     "pdf_name": pdf_name,
                     "page_num": idx,
-                    "mode": job.get("mode", "janzour")
+                    "mode": job.get("mode", "janzour"),
+                    "processed_path": job.get("processed_path")
                 }
                 yield job
             else:
@@ -267,16 +344,22 @@ async def process_janzour_pdf(pdf_path: str, temp_dir: str, progress_callback=No
         "status": "done"
     })
 
-    # STEP 2 — Preprocessing (Janzour-specific)
     batch_jobs = []
     skipped_pages = []
+    processed_image_paths = []
 
     for idx, image_path in enumerate(extracted_images):
         try:
-            job = await prepare_janzour_page(image_path)
+            # Construct a path for the processed/cropped image
+            processed_name = f"page_{idx+1}_processed.jpg"
+            save_path = os.path.join(pdf_images_dir, processed_name)
+
+            job = await prepare_janzour_page(image_path, save_path=save_path)
             if job:
                 job["page_index"] = idx
                 batch_jobs.append(job)
+                if job.get("processed_path"):
+                    processed_image_paths.append(job["processed_path"])
             else:
                 skipped_pages.append({"page_index": idx, "status": "skipped"})
         except Exception as e:
@@ -321,4 +404,4 @@ async def process_janzour_pdf(pdf_path: str, temp_dir: str, progress_callback=No
     
     joined = "\n".join(results_with_separators)
     
-    return joined, skipped_pages
+    return joined, skipped_pages, processed_image_paths

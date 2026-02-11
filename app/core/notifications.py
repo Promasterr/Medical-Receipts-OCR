@@ -24,7 +24,7 @@ def publish_update(task_id: str, message: dict):
     channel = f"task_updates:{task_id}"
     # Ensure message is a string
     try:
-        r.publish(channel, json.dumps(message))
+        r.publish(channel, json.dumps(message, ensure_ascii=False))
     except Exception as e:
         print(f"FAILED TO PUBLISH: {e}")
 
@@ -32,4 +32,4 @@ def publish_update(task_id: str, message: dict):
 # Async version for FastAPI/AsyncIO context if needed
 async def async_publish_update(redis_conn, task_id: str, message: dict):
     channel = f"task_updates:{task_id}"
-    await redis_conn.publish(channel, json.dumps(message))
+    await redis_conn.publish(channel, json.dumps(message, ensure_ascii=False))

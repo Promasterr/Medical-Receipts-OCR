@@ -120,8 +120,18 @@ If a table header is visible → a section MUST be created.
 Page breaks do not end a table unless a new table header appears.
 
 SECTION IDENTITY RULE
-A section is defined a row with only one data cell(<td>).
-every row with only one data cell(<td>) is a section name.
+SECTION HEADER DETECTION RULE (CRITICAL)
+
+A section header row is a table row (<tr>) where:
+
+• Exactly ONE cell contains visible text
+• ALL other cells in the row are empty or placeholders
+• The row contains NO service code
+• The row contains NO numeric price
+
+Such a row defines section_name using the text in the non-empty cell.
+
+This applies EVEN IF the row has multiple <td> elements.
 The same section_name may appear multiple times.
 
 Each table can have multiple sections.
@@ -233,7 +243,7 @@ JSON STRUCTURE
       "sections": [
         {
           "section_name": "String or null",
-          "section_subtotal": "String or null",
+          "section_subtotal": "Number or null",
           "items": [
             {
               "service_description_en": "String or null",
@@ -241,11 +251,11 @@ JSON STRUCTURE
               "code": "String or null",
               "date": "String",
               "time": "String or null",
-              "unit_price": "String or null",
-              "company_price": "String or null",
-              "patient_price": "String or null",
+              "unit_price": "Number or null",
+              "company_price": "Number or null",
+              "patient_price": "Number or null",
               "net_price": "Number or null",
-              "quantity": "String or null",
+              "quantity": "Number or null",
               "amount": "Number or null"
             }
           ]
@@ -253,152 +263,88 @@ JSON STRUCTURE
       ],
       "footer": {
         "net_total_amount": "Number or null",
-        "paid": "String or null",
+        "paid": "Number or null",
         "amount_due": "Number or null"
       }
     }
   ]
 }"""
+
+
+
+
 DEFAULT_JANZOUR_PROMPT = """
-You are an information extraction engine.
+Role: Information Extraction Engine for medical/insurance documents. Core Goal: Extract valid JSON. Accuracy is critical. No calculations.
 
-Your task is to extract structured JSON from hospital billing and medical documents.
+1. Document Identity & Merging
+Primary Key: invoice_number. If null, use medical_number.
 
-This is a medical and insurance document.
-Accuracy and data integrity are critical.
+Continuity: If a key repeats on a later page, APPEND to the existing document object. Do NOT create a duplicate header.
 
-ABSOLUTE CORE PRINCIPLES (NO EXCEPTIONS)
-1. NO CALCULATIONS (EXCEPT WHERE EXPLICITLY ALLOWED)
+File Number: Extract from the first occurrence only.
 
-DO NOT calculate, infer, derive, or estimate totals.
+2. Table & Section Merging (Crucial)
+Merge Logic: If a section (e.g., "تحاليل طبية") appears on Page 1 and again on Page 2, MERGE all items into a single items array.
 
-Copy totals ONLY if explicitly written.
+Item Definition: Every row containing a Service Code (e.g., BIOxxxx, SPExxxx) and a description MUST be extracted as an item.
 
-If a value is missing → use null.
+Anti-Skip: Do not stop extraction because a table looks like it’s ending or a total appears if rows with service codes follow.
 
-Never fabricate values.
+Subtotal: section_subtotal is ONLY the row explicitly labeled "الإجمالي" within that table.
 
-2. ZERO VALUES ARE VALID
+3. Footer Summary Table Logic
+Detection: A table is a Footer Summary (not a section) ONLY if it has 5 columns (Value, Company, Patient, Total, Service) and contains NO service codes.
 
-0, 0.00, "0.00" are valid ONLY if explicitly present.
+Mapping: * net_total_amount = Total (الإجمالي)
 
-Never replace missing values with zero.
+paid = Company (الجهة)
 
-3. PRESERVE ORIGINAL VALUES
+amount_due = Patient (المريض)
 
-Keep prices exactly as written (string format).
+Use the LAST non-zero row of this summary table.
 
-Do not normalize, round, or reformat numbers.
+4. Patient Identity
+Extract patient_identity ONLY from the ID card section.
 
-Do not add derived fields.
+Format id_card_number as ACA-xxxx-xxxxx-xxx.
 
-4. LANGUAGE PRESERVATION
+Outpatient Rules:
+Assign 0 (Inpatient) if the invoice contains ANY of these:
 
-DO NOT translate unless explicitly requested.
+Surgery/Procedures (عملية جراحية / إجراءات طبية).
 
-Arabic stays Arabic.
+Accommodation/Admission (إقامة / دخول), including "Daytime stays" (إقامة نهارية).
 
-English fields are filled only if English text exists.
+Bed/Room Charges (غرفة / سرير).
 
-MULTI-INVOICE & DOCUMENT CONTROL (CRITICAL)
-DOCUMENT GROUPING RULE
+Admission and discharge dates are different.
 
-The unique document key is invoice_number.
+Assign 1 (Outpatient) ONLY if the invoice is restricted to:
 
-Before creating a new document:
+Consultations (كشف), ER visits (طوارئ) without a stay, Pharmacy (أدوية), or Labs (تحاليل).
 
-CHECK all previously created documents.
+Priority Rule: If a document has both (e.g., an ER visit that leads to surgery), it must be 0 (Inpatient).
 
-If the invoice_number already exists:
+5. Data Integrity
+Nulls: Use null for missing values. Do not use 0.00 unless explicitly printed.
 
-REUSE that document
+Strings: Keep all prices/totals as strings to preserve formatting.
 
-APPEND sections to it
+Ignore: Titles like "فاتورة إيواء" or "كشف تفاصيل الخدمات" are labels, not sections.
 
-DO NOT create a new header
+Why this fixes the "Missing Rows" issue:
+Explicit Code Requirement: By telling the model that "Service Code = Item," you prevent it from misidentifying the rows on page 2 as part of the footer summary.
 
-Create a new document ONLY if the invoice number has NEVER appeared before.
+Removing "No New Title" constraint: Your previous prompt told the model not to append if a new title appeared. Since the title repeated on page 2, the model got stuck. This version tells it to merge regardless of repeated titles.
 
-FILE NUMBER IMMUTABILITY
-
-file_number is extracted ONCE per invoice.
-
-If multiple file numbers appear:
-
-Use the FIRST occurrence only
-
-Ignore all others
-
-Never assign multiple file numbers to one invoice.
-
-DOCUMENT LOCKING RULE (CRITICAL)
-
-Once a document for an invoice_number is created:
-
-The header becomes READ-ONLY.
-
-DO NOT overwrite or modify header fields.
-
-Subsequent pages with the same invoice_number:
-
-MAY ONLY append sections
-
-MAY NOT create a new document
-
-CONTINUATION RULE (MANDATORY)
-
-A document continues across ALL pages until a NEW invoice_number is found.
-
-NEVER assume a document is complete before end of input.
-
-Do NOT stop extraction early even if totals appear.
-
-SECTION & TABLE HANDLING
-SECTION ACCUMULATION RULE
-
-Sections with the SAME section_name MAY appear multiple times.
-
-Each physical table = one section object.
-
-DO NOT merge tables unless rows clearly continue.
-
-TABLE ROBUSTNESS RULE
-
-Table column structure may vary.
-
-Always extract rows if ANY of the following exist:
-
-service description
-
-service code
-
-date or time
-
-any price field
-
-Do NOT skip tables due to unfamiliar columns.
-
-Every <tr> containing a service description AND code MUST produce an item.
-
-TABLE COMPLETENESS RULE
-
-EVERY table must be interpreted.
-
-Tables without service_description AND code are NEVER service tables.
-
-SECTION SUBTOTAL RULE
-
-Copy section subtotals ONLY if explicitly written.
-
-If the last row has no code → treat as subtotal row.
-
-If the last row has a code → section_subtotal = null.
-
-HEADER & IDENTITY RULES
+Reduced Token Weight: GPT-4o mini performs better when instructions are punchy. This version removes the wordy explanations and focuses on the "if/then" logic.HEADER & IDENTITY RULES
 
 Extract header fields only if present.
-
-invoice_number and file_number must NOT be empty.
+invoice_number is usually إيصال رقم
+medical_number is usually رقم الطبي
+file_number is usually رقم الدخول
+invoice number can be empty but medical_number and file_number must NOT be empty.
+التاريخ  with  مِن  and  الى   is admission date and discharge date
 
 Do NOT infer:
 
@@ -494,6 +440,10 @@ IGNORE THESE TITLES (NEVER SECTIONS)
 
 كشف تفاصيل الخدمات
 
+
+subtotal is the last row of the table which has الإجمالي
+invoice_number can be empty but medical_number and file_number must NOT be empty.
+get the patient identity from the ID card section.
 These are document titles only.
 
 REQUIRED OUTPUT FORMAT
@@ -512,6 +462,7 @@ JSON STRUCTURE
     {
       "header": {
         "invoice_number": "String",
+        "medical_number": "String",
         "file_number": "String",
         "patient_name": "String",
         "date": "ISO String or null",
@@ -523,7 +474,8 @@ JSON STRUCTURE
         "specialty": "String or null",
         "insurer_name": "String or null",
         "ward": "String or null",
-        "room_type": "String or null"
+        "room_type": "String or null",
+        "Outpatient": "Number (0 for Inpatient, 1 for Outpatient)",
       },
       "patient_identity": {
         "id_employee_name": "String or null",
@@ -534,7 +486,7 @@ JSON STRUCTURE
       "sections": [
         {
           "section_name": "String or null",
-          "section_subtotal": "String or null",
+          "section_subtotal": "Number or null",
           "items": [
             {
               "service_description_en": "String or null",
@@ -542,11 +494,11 @@ JSON STRUCTURE
               "code": "String or null",
               "date": "String",
               "time": "String or null",
-              "unit_price": "String or null",
-              "company_price": "String or null",
-              "patient_price": "String or null",
+              "unit_price": "Number or null",
+              "company_price": "Number or null",
+              "patient_price": "Number or null",
               "net_price": "Number or null",
-              "quantity": "String or null",
+              "quantity": "Number or null",
               "amount": "Number or null"
             }
           ]
@@ -554,7 +506,7 @@ JSON STRUCTURE
       ],
       "footer": {
         "net_total_amount": "Number or null",
-        "paid": "String or null",
+        "paid": "Number or null",
         "amount_due": "Number or null"
       }
     }
@@ -564,7 +516,7 @@ JSON STRUCTURE
 
 def sse(event: str, data):
     """Format Server-Sent Events"""
-    return f"event: {event}\ndata: {json.dumps(data)}\n\n"
+    return f"event: {event}\ndata: {json.dumps(data, ensure_ascii=False)}\n\n"
 
 async def default_progress_callback(event, data):
     pass
@@ -632,8 +584,7 @@ def get_prompt_by_keyword(keyword: str) -> str:
     kw = (keyword or "").lower()
 
     if "janzour" in kw:
-        return (
-            """Extract all text from the document. Transcribe Arabic labels exactly and provide values accurately.
+         return ("""Extract all text from the document. Transcribe Arabic labels exactly and provide values accurately.
 
             STRICT FORMATTING RULES:
             1. Ignore watermarks, QR codes, and logos.
@@ -644,8 +595,7 @@ def get_prompt_by_keyword(keyword: str) -> str:
             
             Note: For fields with dates like 'الإقامة: من 24/04/2025 18:48 إلى 26/04/2025 12:32', extract them exactly as they appear without reordering the dates within the range.
              *FINAL OUTPUT INSTRUCTION:*
-             Present the extracted data (General Details and all table data) structured *ENTIRELY in HTML format*.Only return HTML table within <table></table>. Ignore images, Stamps, Seals"""
-        )
+             Present the extracted data (General Details and all table data) structured *ENTIRELY in HTML format*.Only return HTML table within <table></table>. Ignore images, Stamps, Seals""")
 
     if "massara" in kw:
         return ("""### ROLE
@@ -977,10 +927,10 @@ def process_and_crop_qr_region(image, detections, image_bboxes, expansion_factor
 
 
 
-async def prepare_page_input(image_path: str) -> Optional[Dict]:
+async def prepare_page_input(image_path: str, save_path: Optional[str] = None) -> Optional[Dict]:
     """
     Prepare input for a single page by analyzing layout and determining processing mode.
-    Fully implemented using logic from main.py.
+    If save_path is provided, the final_image is saved there.
     """
     # Load raw (cv2) for layout/qr detectors
     input_image_cv = cv2.imread(image_path)
@@ -1007,7 +957,6 @@ async def prepare_page_input(image_path: str) -> Optional[Dict]:
     # Skip rule: header exists but no table (unless it's an ID card check later)
     # Replicating main.py logic exactly:
     if (not has_table) and has_header:
-        # Check if ID card before skipping? Use main.py logic structure
         pass 
 
     final_image = None
@@ -1128,11 +1077,19 @@ async def prepare_page_input(image_path: str) -> Optional[Dict]:
 
     prompt = get_prompt_by_keyword(keyword)
 
+    # Save the processed image if requested
+    processed_path = None
+    if save_path and final_image:
+        os.makedirs(os.path.dirname(save_path), exist_ok=True)
+        final_image.save(save_path, format="JPEG")
+        processed_path = save_path
+
     return {
         "image": final_image,
         "prompt": prompt,
         "mode": mode,
         "original_path": image_path,
+        "processed_path": processed_path
     }
 
 
@@ -1178,9 +1135,9 @@ async def _run_single_inference_task(job: Dict, max_new_tokens: int) -> Union[st
             return "Error: No generation returned."
             
     except Exception as e:
-        # Return the exception object instead of raising it,
-        # allowing other tasks to complete.
-        return e
+        # Raise the exception to be caught by the caller.
+        # This ensures that connection errors are handled properly.
+        raise e
 
 
 async def run_batch_inference(batch_jobs: List[Dict], max_new_tokens: int = 8192) -> List[str]:
@@ -1250,7 +1207,7 @@ async def _run_single_inference_task_with_metadata(
 
 async def run_buffered_batch_inference(
     image_iterator,
-    max_concurrent: int = 16
+    max_concurrent: int = 10
 ):
     """
     True sliding window inference - keeps exactly N images in flight at all times.
@@ -1272,6 +1229,11 @@ async def run_buffered_batch_inference(
     tasks = set()
     
     async for job in image_iterator:
+        # Check if this job is already marked as skipped
+        if job.get("skipped"):
+            yield job.get("uuid"), job.get("metadata"), None
+            continue
+
         # Wait for a task to complete if we hit the limit
         if len(tasks) >= max_concurrent:
             done, tasks = await asyncio.wait(
@@ -1338,9 +1300,9 @@ async def process_single_pdf_batched(pdf_path: str, temp_dir: str, max_new_token
                 job["page_index"] = idx
                 batch_jobs.append(job)
             else:
-                skipped_pages.append({"page_index": idx, "status": "skipped"})
+                skipped_pages.append({"page_index": idx, "reason": "skipped"})
         except Exception as e:
-            skipped_pages.append({"page_index": idx, "error": str(e)})
+            skipped_pages.append({"page_index": idx, "reason": str(e)})
 
     yield sse("progress", {
         "step": "preprocessing",
@@ -1522,17 +1484,24 @@ async def run_ocr_pipeline(pdf_path: str, temp_dir: str, max_new_tokens: int = 8
     # STEP 2 — Preprocessing
     batch_jobs = []
     skipped_pages = []
+    processed_image_paths = []
 
     for idx, image_path in enumerate(extracted_images):
         try:
-            job = await prepare_page_input(image_path)
+            # Construct a path for the processed/cropped image
+            processed_name = f"page_{idx+1}_processed.jpg"
+            save_path = os.path.join(pdf_images_dir, processed_name)
+            
+            job = await prepare_page_input(image_path, save_path=save_path)
             if job:
                 job["page_index"] = idx
                 batch_jobs.append(job)
+                if job.get("processed_path"):
+                    processed_image_paths.append(job["processed_path"])
             else:
-                skipped_pages.append({"page_index": idx, "status": "skipped"})
+                skipped_pages.append({"page_index": idx, "reason": "skipped"})
         except Exception as e:
-            skipped_pages.append({"page_index": idx, "error": str(e)})
+            skipped_pages.append({"page_index": idx, "reason": str(e)})
 
     await progress_callback("progress", {
         "step": "preprocessing",
@@ -1556,7 +1525,7 @@ async def run_ocr_pipeline(pdf_path: str, temp_dir: str, max_new_tokens: int = 8
     })
 
     joined = "\n".join(raw_results)
-    return joined, skipped_pages
+    return joined, skipped_pages, processed_image_paths
     
 
 async def run_gpt_pipeline(text: str, progress_callback=None, system_prompt: str = None):

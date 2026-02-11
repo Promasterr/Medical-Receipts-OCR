@@ -31,11 +31,26 @@ async def health_check():
 @router.get("/models")
 async def check_models():
     """
-    Check if all models are loaded.
+    Check if all models are loaded and verify vLLM connectivity.
     """
+    vllm_ok = False
+    vllm_error = None
+    
+    if model_manager.vllm_client:
+        try:
+            # Minimal check: list models
+            model_manager.vllm_client.models.list()
+            vllm_ok = True
+        except Exception as e:
+            vllm_error = str(e)
+
     return {
         "layout_model": model_manager.layout_model is not None,
         "barcode_model": model_manager.barcode_model is not None,
         "qr_detector": model_manager.qr_detector is not None,
-        "vllm_client": model_manager.vllm_client is not None
+        "vllm_client": {
+            "initialized": model_manager.vllm_client is not None,
+            "reachable": vllm_ok,
+            "error": vllm_error
+        }
     }

@@ -33,6 +33,7 @@ async def process_safwa_pdf(file: UploadFile = File(...)):
     # Launch Celery Task (uses Janzour pipeline)
     task = process_janzour_pipeline.apply_async(
         args=[os.path.abspath(file_path), file.filename],
+        kwargs={"template": "safwa"},
         task_id=task_id
     )
     
@@ -74,6 +75,7 @@ async def batch_process_safwa_pdf(files: List[UploadFile] = File(...)):
     from app.tasks import process_janzour_batch_pipeline
     process_janzour_batch_pipeline.apply_async(
         args=[pdf_paths, batch_id],
+        kwargs={"template": "safwa"},
         task_id=batch_id
     )
     

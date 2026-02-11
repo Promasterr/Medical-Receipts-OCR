@@ -61,8 +61,8 @@ def validate_json_with_images(image_paths: List[str], json_content: Any) -> Dict
     client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
     try:
         response = client.chat.completions.create(
-            model="gpt-4o",
-            temperature=0,
+            model="gpt-4o-mini",
+            temperature=0.4,
             messages=[
                 {
                     "role": "system",

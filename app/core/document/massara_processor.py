@@ -24,7 +24,7 @@ from app.core.document.pdf_processor import (
 )
 
 
-async def prepare_massara_page(image_path: str) -> Optional[Dict]:
+async def prepare_massara_page(image_path: str, save_path: Optional[str] = None) -> Optional[Dict]:
     """
     Prepare input for a single page using Massara template logic.
     Includes ID card detection as fallback.
@@ -148,6 +148,13 @@ async def prepare_massara_page(image_path: str) -> Optional[Dict]:
 
     prompt = get_prompt_by_keyword(keyword)
 
+    # Save the processed image if requested
+    processed_path = None
+    if save_path and final_image:
+        os.makedirs(os.path.dirname(save_path), exist_ok=True)
+        final_image.save(save_path, format="JPEG")
+        processed_path = save_path
+
     # Safety check: ensure we have a valid image before returning
     if final_image is None:
         print(f"prepare_massara_page: skip (no valid image generated) — {image_path}")
@@ -158,6 +165,7 @@ async def prepare_massara_page(image_path: str) -> Optional[Dict]:
         "prompt": prompt,
         "mode": mode,
         "original_path": image_path,
+        "processed_path": processed_path
     }
 
 
@@ -182,7 +190,14 @@ async def preprocess_pdf_async(pdf_path: str, temp_dir: str):
             - metadata: Dict with pdf_path, page_num, mode, pdf_name
     """
     from pathlib import Path
-    pdf_name = Path(pdf_path).stem
+    full_stem = Path(pdf_path).stem
+    # The file_id is constructed as {task_id}_{original_filename} in routes
+    # UUID is 36 chars, plus underscore = 37 chars prefix
+    if len(full_stem) > 37 and full_stem[36] == '_':
+        pdf_name = full_stem[37:]
+    else:
+        pdf_name = full_stem
+
     pdf_images_dir = os.path.join(temp_dir, f"{pdf_name}_images")
     os.makedirs(pdf_images_dir, exist_ok=True)
 
@@ -192,7 +207,11 @@ async def preprocess_pdf_async(pdf_path: str, temp_dir: str):
     # Yield preprocessed images one at a time
     for idx, image_path in enumerate(extracted_images):
         try:
-            job = await prepare_massara_page(image_path)
+            # Construct a path for the processed/cropped image
+            processed_name = f"page_{idx+1}_processed.jpg"
+            save_path = os.path.join(pdf_images_dir, processed_name)
+
+            job = await prepare_massara_page(image_path, save_path=save_path)
             if job:
                 # Add UUID and metadata
                 job["uuid"] = str(uuid.uuid4())
@@ -200,7 +219,8 @@ async def preprocess_pdf_async(pdf_path: str, temp_dir: str):
                     "pdf_path": pdf_path,
                     "pdf_name": pdf_name,
                     "page_num": idx,
-                    "mode": job.get("mode", "massara")
+                    "mode": job.get("mode", "massara"),
+                    "processed_path": job.get("processed_path")
                 }
                 yield job
             else:
@@ -265,20 +285,26 @@ async def process_massara_pdf(pdf_path: str, temp_dir: str, progress_callback=No
         "status": "done"
     })
 
-    # STEP 2 — Preprocessing (Massara-specific)
     batch_jobs = []
     skipped_pages = []
+    processed_image_paths = []
     
     print(f"DEBUG: Starting preprocessing for {len(extracted_images)} extracted images")
 
     for idx, image_path in enumerate(extracted_images):
         try:
             print(f"DEBUG: Processing page {idx + 1}/{len(extracted_images)}: {image_path}")
-            job = await prepare_massara_page(image_path)
+            # Construct a path for the processed/cropped image
+            processed_name = f"page_{idx+1}_processed.jpg"
+            save_path = os.path.join(pdf_images_dir, processed_name)
+
+            job = await prepare_massara_page(image_path, save_path=save_path)
             if job:
                 print(f"DEBUG: Page {idx + 1} prepared successfully. Mode: {job.get('mode')}")
                 job["page_index"] = idx
                 batch_jobs.append(job)
+                if job.get("processed_path"):
+                    processed_image_paths.append(job["processed_path"])
             else:
                 print(f"DEBUG: Page {idx + 1} skipped (prepare_massara_page returned None)")
                 skipped_pages.append({"page_index": idx, "status": "skipped"})
@@ -330,4 +356,4 @@ async def process_massara_pdf(pdf_path: str, temp_dir: str, progress_callback=No
     print(f"DEBUG: Joined raw text length: {len(joined)}")
     print(f"DEBUG: Raw text snippet (first 500 chars):\n{joined[:500]}")
     
-    return joined, skipped_pages
+    return joined, skipped_pages, processed_image_paths

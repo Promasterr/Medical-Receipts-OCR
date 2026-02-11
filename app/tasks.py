@@ -25,20 +25,53 @@ os.makedirs(INTERIM_DIR, exist_ok=True)
 def get_result_path(task_id: str):
     return os.path.join(RESULTS_DIR, f"{task_id}.json")
 
-async def progress_callback_wrapper(task_id, event, data):
-    # Wrapper to publish updates to Redis
-    # We include task_id and pdf_name in every update if possible, 
-    # but the caller of this wrapper doesn't know pdf_name explicitly unless we pass it.
-    # The requirement: "return it along with each stream" (the pdf name).
-    # We can retrieve pdf_name from data if we want, or pass it in wrapper.
-    # Let's assume the data payload is enough, and we wrap it.
+def send_task_update(task_id, event, filename=None, batch_id=None, data=None, message=None, 
+                     raw_text=None, validation_review=None, skipped=None, raw_json=None):
+    """
+    Standardized WebSocket update formatter.
+    """
+    data_payload = data if isinstance(data, dict) else {"message": str(data)} if data else {}
     
+    # Extract values from parameters or data_payload
+    msg = message or data_payload.get("message") or ""
+    rt = raw_text or data_payload.get("raw_text")
+    vr = validation_review or data_payload.get("validation_review")
+    sk = skipped or data_payload.get("skipped_pages") or data_payload.get("skipped")
+    
+    # The 'result' should be the parsed JSON object
+    res = data_payload.get("result")
+    
+    # Construct the data block
+    inner_data = {
+        "result": res,
+        "raw_text": rt,
+        "validation_review": vr,
+        "skipped": sk
+    }
+    
+    # Merge any other extra fields from data_payload (excluding identifiers and raw JSON)
+    for k, v in data_payload.items():
+        if k not in ["result", "raw_text", "validation_review", "skipped", "skipped_pages", 
+                     "message", "event", "task_id", "filename", "batch_id", 
+                     "raw_json_response", "raw_json"]:
+            inner_data[k] = v
+
+    # Final payload structure
     payload = {
         "task_id": task_id,
+        "filename": filename,
+        "batch_id": batch_id,
+        "message": msg,
         "event": event,
-        "data": data
+        "data": inner_data
     }
+
     publish_update(task_id, payload)
+
+async def progress_callback_wrapper(task_id, event, data):
+    # Wrapper to publish updates to Redis
+    filename = data.get("filename") if isinstance(data, dict) else None
+    send_task_update(task_id, event, filename=filename, data=data)
 
 @celery_app.task(bind=True, name="app.tasks.process_document_pipeline")
 def process_document_pipeline(self, pdf_path: str, original_filename: str, batch_id: str = None):
@@ -49,13 +82,8 @@ def process_document_pipeline(self, pdf_path: str, original_filename: str, batch
     task_id = self.request.id
     
     # Notify start
-    publish_update(task_id, {
-        "task_id": task_id,
-        "filename": original_filename,
-        "batch_id": batch_id,
-        "status": "started",
-        "message": f"Started processing {original_filename}"
-    })
+    send_task_update(task_id, "started", filename=original_filename, batch_id=batch_id, 
+                     message=f"Started processing {original_filename}")
     
     # We use chain to ensure strict ordering: OCR -> GPT
     # But we want to pass the result of OCR to GPT.
@@ -85,35 +113,19 @@ def process_ocr_task(self, pdf_path: str, original_filename: str, parent_task_id
         
         async def callback(event, data):
              # Inject filename into data if needed
-             msg = {
-                "task_id": task_id,
-                "filename": original_filename,
-                "event": event,
-                "data": data
-             }
-             publish_update(task_id, msg)
+             send_task_update(task_id, event, filename=original_filename, data=data)
          
         try:
-             text, skipped = await run_ocr_pipeline(pdf_path, task_interim_dir, progress_callback=callback)
+             text, skipped, processed_image_paths = await run_ocr_pipeline(pdf_path, task_interim_dir, progress_callback=callback)
              
-             # Collect image paths recursively
-             image_paths = []
-             if os.path.exists(task_interim_dir):
-                 for root, dirs, files in os.walk(task_interim_dir):
-                     for file in files:
-                         if file.lower().endswith(('.png', '.jpg', '.jpeg')):
-                             image_paths.append(os.path.join(root, file))
-                 image_paths.sort() # Ensure consistent order
+             # Use the processed image paths from the pipeline
+             image_paths = processed_image_paths
              
              return {"text": text, "skipped": skipped, "pdf_path": pdf_path, "image_paths": image_paths}
         except Exception as e:
              # Send failure notification
-             publish_update(task_id, {
-                 "task_id": task_id,
-                 "filename": original_filename,
-                 "event": "error",
-                 "data": {"message": f"OCR failed: {str(e)}"}
-             })
+             send_task_update(task_id, "error", filename=original_filename, 
+                              message=f"OCR failed: {str(e)}")
              raise e 
 
     # Run async code in sync task
@@ -146,24 +158,12 @@ def process_gpt_extraction(self, ocr_result: dict, original_filename: str, paren
     def run_gpt():
         async def main_async():
             if not text:
-                publish_update(task_id, {
-                    "task_id": task_id,
-                    "filename": original_filename,
-                    "batch_id": batch_id,
-                    "event": "completed",
-                    "data": {"result": {}, "message": "No text detected in OCR"}
-                })
+                send_task_update(task_id, "completed", filename=original_filename, batch_id=batch_id,
+                                 message="No text detected in OCR", data={"result": {}})
                 return {}
 
             async def callback(event, data):
-                 msg = {
-                    "task_id": task_id,
-                    "filename": original_filename,
-                    "batch_id": batch_id,
-                    "event": event,
-                    "data": data
-                 }
-                 publish_update(task_id, msg)
+                 send_task_update(task_id, event, filename=original_filename, batch_id=batch_id, data=data)
             
             # Notify GPT starting
             print(f"DEBUG: [{task_id}] GPT extraction starting for {original_filename}. Text length: {len(text)}")
@@ -200,42 +200,29 @@ def process_gpt_extraction(self, ocr_result: dict, original_filename: str, paren
                  "filename": original_filename,
                  "batch_id": batch_id,
                  "processed_at": time.time(),
-                 "result": parsed_result,
-                 "result": parsed_result,
-                 "raw_text": text[:50000] + "..." if len(text) > 50000 else text, 
-                 "skipped": skipped_pages,
-                 "image_paths": image_paths
-             }
+                "result": parsed_result,
+                "raw_json_response": json_result_str,
+                "raw_text": text,
+                "skipped": skipped_pages,
+                "image_paths": image_paths,
+                "template": template
+            }
              
-             # Notify completion of extraction step (NOT final completion)
-             publish_update(task_id, {
-                 "task_id": task_id,
-                 "filename": original_filename,
-                 "batch_id": batch_id,
-                 "event": "step_completed", 
-                 "data": {"step": "extraction", "message": "GPT extraction complete"}
-             })
+             send_task_update(task_id, "step_completed", filename=original_filename, batch_id=batch_id,
+                              data={"step": "extraction", "message": "GPT extraction complete"})
              
              return result_data
              
         except Exception as e:
-             publish_update(task_id, {
-                 "task_id": task_id,
-                 "filename": original_filename,
-                 "batch_id": batch_id, 
-                 "event": "error",
-                 "data": {"message": f"GPT failed: {str(e)}"}
-             })
+             send_task_update(task_id, "error", filename=original_filename, batch_id=batch_id,
+                              message=f"GPT failed: {str(e)}")
              if batch_id:
                  from redis import Redis
                  r = Redis.from_url(settings.REDIS_URL, decode_responses=True)
                  remaining = r.decr(f"batch_count:{batch_id}")
                  if remaining <= 0:
-                      publish_update(task_id, {
-                         "event": "batch_completed",
-                         "batch_id": batch_id,
-                         "message": "All PDFs in this batch have been processed (with errors)."
-                     })
+                       send_task_update(task_id, "batch_completed", batch_id=batch_id,
+                                        message="All PDFs in this batch have been processed (with errors).")
              raise e
 
     return run_gpt()
@@ -256,17 +243,18 @@ def process_validation_task(self, extraction_result: dict, original_filename: st
     image_paths = extraction_result.get("image_paths", [])
     json_result = extraction_result.get("result", {})
     
-    # Notify start
-    publish_update(task_id, {
-        "task_id": task_id,
-        "filename": original_filename,
-        "batch_id": batch_id,
-        "event": "progress",
-        "data": {"step": "validation", "message": "Validating extraction against document images"}
-    })
+    send_task_update(task_id, "progress", filename=original_filename, batch_id=batch_id,
+                     data={"step": "validation", "message": "Validating extraction against document images"})
 
     try:
-        validation_review = validate_json_with_images(image_paths, json_result)
+        template = extraction_result.get("template")
+        bypass_templates = ["janzour", "safwa", "massara", "muasafat", "musafat"]
+        
+        if template in bypass_templates:
+             print(f"DEBUG: Bypassing validation for template: {template}")
+             validation_review = ""
+        else:
+             validation_review = validate_json_with_images(image_paths, json_result)
         
         # Add review to result
         final_result = extraction_result.copy()
@@ -289,13 +277,7 @@ def process_validation_task(self, extraction_result: dict, original_filename: st
             del final_result["image_paths"]
 
         # Notify FINAL completion
-        publish_update(task_id, {
-             "task_id": task_id,
-             "filename": original_filename,
-             "batch_id": batch_id,
-             "event": "completed", 
-             "data": final_result
-        })
+        send_task_update(task_id, "completed", filename=original_filename, batch_id=batch_id, data=final_result)
 
         # Check for Batch Completion
         if batch_id:
@@ -304,11 +286,8 @@ def process_validation_task(self, extraction_result: dict, original_filename: st
              remaining = r.decr(f"batch_count:{batch_id}")
              
              if remaining <= 0:
-                 publish_update(task_id, {
-                     "event": "batch_completed",
-                     "batch_id": batch_id,
-                     "message": "All PDFs in this batch have been processed."
-                 })
+                 send_task_update(task_id, "batch_completed", batch_id=batch_id,
+                                  message="All PDFs in this batch have been processed.")
                  r.delete(f"batch_count:{batch_id}")
         
         return final_result
@@ -318,13 +297,7 @@ def process_validation_task(self, extraction_result: dict, original_filename: st
         # Even if validation fails, return the extraction result but mark error
         extraction_result["validation_error"] = str(e)
         
-        publish_update(task_id, {
-             "task_id": task_id,
-             "filename": original_filename,
-             "batch_id": batch_id,
-             "event": "completed", 
-             "data": extraction_result
-        })
+        send_task_update(task_id, "completed", filename=original_filename, batch_id=batch_id, data=extraction_result)
         return extraction_result
 
 
@@ -359,26 +332,20 @@ def cleanup_old_results():
 # ============================================================================
 
 @celery_app.task(bind=True, name="app.tasks.process_janzour_pipeline")
-def process_janzour_pipeline(self, pdf_path: str, original_filename: str, batch_id: str = None):
+def process_janzour_pipeline(self, pdf_path: str, original_filename: str, batch_id: str = None, template: str = "janzour"):
     """
     Orchestrator task for Janzour template (also used for Safwa).
     Chains OCR -> GPT extraction.
     """
     task_id = self.request.id
     
-    # Notify start
-    publish_update(task_id, {
-        "task_id": task_id,
-        "filename": original_filename,
-        "batch_id": batch_id,
-        "status": "started",
-        "template": "janzour",
-        "message": f"Started processing {original_filename} (Janzour template)"
-    })
+    send_task_update(task_id, "started", filename=original_filename, batch_id=batch_id,
+                     message=f"Started processing {original_filename} ({template} template)",
+                     data={"template": template})
     
     chain(
         process_janzour_ocr_task.s(pdf_path, original_filename, task_id, batch_id),
-        process_gpt_extraction.s(original_filename, task_id, batch_id, template="janzour"),
+        process_gpt_extraction.s(original_filename, task_id, batch_id, template=template),
         process_validation_task.s(original_filename, task_id, batch_id)
     ).apply_async()
 
@@ -396,36 +363,19 @@ def process_janzour_ocr_task(self, pdf_path: str, original_filename: str, parent
         os.makedirs(task_interim_dir, exist_ok=True)
 
         async def callback(event, data):
-            msg = {
-                "task_id": task_id,
-                "filename": original_filename,
-                "template": "janzour",
-                "event": event,
-                "data": data
-            }
-            publish_update(task_id, msg)
+             send_task_update(task_id, event, filename=original_filename, data=data, 
+                              message=data.get("message") if isinstance(data, dict) else None)
         
         try:
-            text, skipped = await process_janzour_pdf(pdf_path, task_interim_dir, progress_callback=callback)
+            text, skipped, processed_image_paths = await process_janzour_pdf(pdf_path, task_interim_dir, progress_callback=callback)
             
-            # Collect image paths recursively
-            image_paths = []
-            if os.path.exists(task_interim_dir):
-                for root, dirs, files in os.walk(task_interim_dir):
-                    for file in files:
-                        if file.lower().endswith(('.png', '.jpg', '.jpeg')):
-                            image_paths.append(os.path.join(root, file))
-                image_paths.sort()
+            # Use the processed image paths from the pipeline
+            image_paths = processed_image_paths
 
             return {"text": text, "skipped": skipped, "pdf_path": pdf_path, "image_paths": image_paths}
         except Exception as e:
-            publish_update(task_id, {
-                "task_id": task_id,
-                "filename": original_filename,
-                "template": "janzour",
-                "event": "error",
-                "data": {"message": f"Janzour OCR failed: {str(e)}"}
-            })
+            send_task_update(task_id, "error", filename=original_filename, 
+                             message=f"Janzour OCR failed: {str(e)}", data={"template": "janzour"})
             raise e
 
     try:
@@ -435,26 +385,20 @@ def process_janzour_ocr_task(self, pdf_path: str, original_filename: str, parent
 
 
 @celery_app.task(bind=True, name="app.tasks.process_massara_pipeline")
-def process_massara_pipeline(self, pdf_path: str, original_filename: str, batch_id: str = None):
+def process_massara_pipeline(self, pdf_path: str, original_filename: str, batch_id: str = None, template: str = "massara"):
     """
     Orchestrator task for Massara template (also used for Muasafat).
     Chains OCR -> GPT extraction.
     """
     task_id = self.request.id
     
-    # Notify start
-    publish_update(task_id, {
-        "task_id": task_id,
-        "filename": original_filename,
-        "batch_id": batch_id,
-        "status": "started",
-        "template": "massara",
-        "message": f"Started processing {original_filename} (Massara template)"
-    })
+    send_task_update(task_id, "started", filename=original_filename, batch_id=batch_id,
+                     message=f"Started processing {original_filename} ({template} template)",
+                     data={"template": template})
     
     chain(
         process_massara_ocr_task.s(pdf_path, original_filename, task_id, batch_id),
-        process_gpt_extraction.s(original_filename, task_id, batch_id, template="massara"),
+        process_gpt_extraction.s(original_filename, task_id, batch_id, template=template),
         process_validation_task.s(original_filename, task_id, batch_id)
     ).apply_async()
 
@@ -472,36 +416,19 @@ def process_massara_ocr_task(self, pdf_path: str, original_filename: str, parent
         os.makedirs(task_interim_dir, exist_ok=True)
         
         async def callback(event, data):
-            msg = {
-                "task_id": task_id,
-                "filename": original_filename,
-                "template": "massara",
-                "event": event,
-                "data": data
-            }
-            publish_update(task_id, msg)
+            send_task_update(task_id, event, filename=original_filename, data=data,
+                             message=data.get("message") if isinstance(data, dict) else None)
         
         try:
-            text, skipped = await process_massara_pdf(pdf_path, task_interim_dir, progress_callback=callback)
+            text, skipped, processed_image_paths = await process_massara_pdf(pdf_path, task_interim_dir, progress_callback=callback)
             
-            # Collect image paths recursively
-            image_paths = []
-            if os.path.exists(task_interim_dir):
-                for root, dirs, files in os.walk(task_interim_dir):
-                    for file in files:
-                        if file.lower().endswith(('.png', '.jpg', '.jpeg')):
-                            image_paths.append(os.path.join(root, file))
-                image_paths.sort()
+            # Use the processed image paths from the pipeline
+            image_paths = processed_image_paths
 
             return {"text": text, "skipped": skipped, "pdf_path": pdf_path, "image_paths": image_paths}
         except Exception as e:
-            publish_update(task_id, {
-                "task_id": task_id,
-                "filename": original_filename,
-                "template": "massara",
-                "event": "error",
-                "data": {"message": f"Massara OCR failed: {str(e)}"}
-            })
+            send_task_update(task_id, "error", filename=original_filename,
+                             message=f"Massara OCR failed: {str(e)}", data={"template": "massara"})
             raise e
 
     try:
@@ -533,8 +460,8 @@ def save_interim_result(batch_id: str, pdf_name: str, ocr_data: dict) -> str:
     )
     os.makedirs(os.path.dirname(interim_file), exist_ok=True)
     
-    with open(interim_file, 'w') as f:
-        json.dump(ocr_data, f)
+    with open(interim_file, 'w', encoding='utf-8') as f:
+        json.dump(ocr_data, f, ensure_ascii=False)
     
     return interim_file
 
@@ -552,9 +479,6 @@ def group_results_by_pdf(result_map: dict) -> dict:
     pdf_groups = {}
     
     for uuid, data in result_map.items():
-        if data.get("skipped"):
-            continue
-            
         metadata = data.get("metadata", {})
         pdf_name = metadata.get("pdf_name")
         
@@ -568,19 +492,23 @@ def group_results_by_pdf(result_map: dict) -> dict:
                 "skipped_pages": []
             }
         
+        # Check if the page was skipped or has an error
+        if data.get("skipped") or metadata.get("status") in ["skipped", "error"]:
+            # Determine reason - priority to 'error' in metadata then 'reason' if any
+            reason = metadata.get("reason") or metadata.get("error") or "skipped"
+            pdf_groups[pdf_name]["skipped_pages"].append({
+                "page_num": metadata.get("page_num"),
+                "reason": str(reason)
+            })
+            continue
+
         page_data = {
             "page_num": metadata.get("page_num"),
             "mode": metadata.get("mode"),
-            "text": data.get("result", "")
+            "text": data.get("result", ""),
+            "processed_path": data.get("processed_path")
         }
-        
-        if metadata.get("status") == "error":
-            pdf_groups[pdf_name]["skipped_pages"].append({
-                "page_num": metadata.get("page_num"),
-                "error": metadata.get("error")
-            })
-        else:
-            pdf_groups[pdf_name]["pages"].append(page_data)
+        pdf_groups[pdf_name]["pages"].append(page_data)
     
     # Sort pages and join text
     for pdf_name, group in pdf_groups.items():
@@ -597,6 +525,8 @@ def group_results_by_pdf(result_map: dict) -> dict:
             texts.append(f"{separator}\n{page['text']}")
         
         group["joined_text"] = "\n".join(texts)
+        # Collect image paths for the PDF
+        group["image_paths"] = [p.get("processed_path") for p in group["pages"] if p.get("processed_path")]
     
     return pdf_groups
 
@@ -608,7 +538,7 @@ def group_results_by_pdf(result_map: dict) -> dict:
     time_limit=9000,  # 2.5 hours
     acks_late=True
 )
-def process_janzour_batch_pipeline(self, pdf_paths: list, batch_id: str):
+def process_janzour_batch_pipeline(self, pdf_paths: list, batch_id: str, template: str = "janzour"):
     """
     Batch orchestrator task for Janzour template using buffered pipeline.
     
@@ -623,46 +553,53 @@ def process_janzour_batch_pipeline(self, pdf_paths: list, batch_id: str):
         from app.core.document.janzour_processor import preprocess_pdf_async
         from app.core.document.pdf_processor import run_buffered_batch_inference
         
-        # Notify batch start
-        publish_update(batch_id, {
-            "batch_id": batch_id,
-            "status": "started",
-            "pdf_count": len(pdf_paths),
-            "template": "janzour",
-            "message": f"Starting batch processing of {len(pdf_paths)} PDFs (Janzour template)"
-        })
+        send_task_update(batch_id, "started", batch_id=batch_id,
+                         message=f"Starting batch processing of {len(pdf_paths)} PDFs ({template} template)",
+                         data={"template": template, "pdf_count": len(pdf_paths)})
         
         # Stage 1: Create async preprocessing stream
         async def preprocess_stream():
             for pdf_path in pdf_paths:
                 interim_dir = os.path.join(INTERIM_DIR, batch_id)
                 async for job in preprocess_pdf_async(pdf_path, interim_dir):
-                    # Filter out skipped pages from inference
-                    if not job.get("skipped"):
-                        yield job
+                    # Always yield the job, even if skipped, to track it
+                    yield job
         
         # Stage 2: Buffered inference with true sliding window
         result_map = {}
         total_pages = 0
+        ocr_pages_count = 0
         start_time = time.time()
         
         async for uuid, metadata, result in run_buffered_batch_inference(
             preprocess_stream(),
-            max_concurrent=16
+            max_concurrent=6
         ):
             total_pages += 1
+            
+            # Check if result is an exception (e.g. APIConnectionError)
+            if isinstance(result, Exception):
+                print(f"⚠️ Error processing page {metadata.get('page_num')}: {result}")
+                metadata["status"] = "error"
+                metadata["error"] = str(result)
+                result = str(result)
+
+            if result is not None:
+                ocr_pages_count += 1
+
             result_map[uuid] = {
                 "metadata": metadata,
                 "result": result,
-                "skipped": metadata.get("status") in ["skipped", "error"]
+                "skipped": metadata.get("status") in ["skipped", "error"],
+                "processed_path": metadata.get("processed_path")
             }
         
         end_time = time.time()
         total_duration = end_time - start_time
-        avg_per_page = total_duration / total_pages if total_pages > 0 else 0
+        avg_per_page = total_duration / ocr_pages_count if ocr_pages_count > 0 else 0
         
         print("-" * 50)
-        print(f"✅ BATCH OCR COMPLETE ({total_pages} pages)")
+        print(f"✅ BATCH OCR COMPLETE ({total_pages} pages, {ocr_pages_count} processed)")
         print(f"⏱️ Total Time: {total_duration:.2f} seconds")
         print(f"⚡ Avg Time Per Page: {avg_per_page:.2f} seconds/page")
         print("-" * 50)
@@ -685,7 +622,7 @@ def process_janzour_batch_pipeline(self, pdf_paths: list, batch_id: str):
                     pdf_name,
                     pdf_task_id,
                     batch_id,
-                    template="janzour"
+                    template=template
                 ),
                 process_validation_task.s(
                     pdf_name,
@@ -694,25 +631,22 @@ def process_janzour_batch_pipeline(self, pdf_paths: list, batch_id: str):
                 )
             ).apply_async(task_id=pdf_task_id)
         
-        # Notify batch OCR complete
-        publish_update(batch_id, {
-            "batch_id": batch_id,
-            "status": "ocr_complete",
-            "processed_pdfs": len(pdf_results),
-            "total_pages": total_pages,
-            "total_time": total_duration,
-            "avg_time_per_page": avg_per_page,
-            "message": f"OCR complete for {len(pdf_results)} PDFs ({total_pages} pages) in {total_duration:.2f}s ({avg_per_page:.2f}s/page)"
-        })
+        send_task_update(batch_id, "ocr_complete", batch_id=batch_id,
+                         message=f"OCR complete for {len(pdf_results)} PDFs ({total_pages} pages, {ocr_pages_count} processed)",
+                         data={
+                             "processed_pdfs": len(pdf_results), 
+                             "total_pages": total_pages,
+                             "ocr_pages_count": ocr_pages_count,
+                             "total_time": total_duration,
+                             "avg_time_per_page": avg_per_page
+                         })
     
     try:
         asyncio.run(batch_orchestrator())
     except Exception as e:
-        publish_update(batch_id, {
-            "batch_id": batch_id,
-            "status": "error",
-            "message": f"Batch processing failed: {str(e)}"
-        })
+        send_task_update(batch_id, "error", batch_id=batch_id,
+                         message=f"Batch processing failed: {str(e)}")
+
         raise e
 
 
@@ -723,7 +657,7 @@ def process_janzour_batch_pipeline(self, pdf_paths: list, batch_id: str):
     time_limit=9000,
     acks_late=True
 )
-def process_massara_batch_pipeline(self, pdf_paths: list, batch_id: str):
+def process_massara_batch_pipeline(self, pdf_paths: list, batch_id: str, template: str = "massara"):
     """
     Batch orchestrator task for Massara template using buffered pipeline.
     """
@@ -732,31 +666,39 @@ def process_massara_batch_pipeline(self, pdf_paths: list, batch_id: str):
         from app.core.document.massara_processor import preprocess_pdf_async
         from app.core.document.pdf_processor import run_buffered_batch_inference
         
-        publish_update(batch_id, {
-            "batch_id": batch_id,
-            "status": "started",
-            "pdf_count": len(pdf_paths),
-            "template": "massara",
-            "message": f"Starting batch processing of {len(pdf_paths)} PDFs (Massara template)"
-        })
+        send_task_update(batch_id, "started", batch_id=batch_id,
+                         message=f"Starting batch processing of {len(pdf_paths)} PDFs ({template} template)",
+                         data={"template": template, "pdf_count": len(pdf_paths)})
         
         async def preprocess_stream():
             for pdf_path in pdf_paths:
                 interim_dir = os.path.join(INTERIM_DIR, batch_id)
                 async for job in preprocess_pdf_async(pdf_path, interim_dir):
-                    if not job.get("skipped"):
-                        yield job
+                    # Always yield the job, even if skipped, to track it
+                    yield job
         
         # Stage 2: Buffered inference with true sliding window
         result_map = {}
         total_pages = 0
+        ocr_pages_count = 0
         start_time = time.time()
         
         async for uuid, metadata, result in run_buffered_batch_inference(
             preprocess_stream(),
-            max_concurrent=16
+            max_concurrent=6
         ):
             total_pages += 1
+
+            # Check if result is an exception (e.g. APIConnectionError)
+            if isinstance(result, Exception):
+                print(f"⚠️ Error processing page {metadata.get('page_num')}: {result}")
+                metadata["status"] = "error"
+                metadata["error"] = str(result)
+                result = str(result)
+
+            if result is not None:
+                ocr_pages_count += 1
+
             result_map[uuid] = {
                 "metadata": metadata,
                 "result": result,
@@ -765,10 +707,10 @@ def process_massara_batch_pipeline(self, pdf_paths: list, batch_id: str):
             
         end_time = time.time()
         total_duration = end_time - start_time
-        avg_per_page = total_duration / total_pages if total_pages > 0 else 0
+        avg_per_page = total_duration / ocr_pages_count if ocr_pages_count > 0 else 0
         
         print("-" * 50)
-        print(f"✅ BATCH OCR COMPLETE ({total_pages} pages)")
+        print(f"✅ BATCH OCR COMPLETE ({total_pages} pages, {ocr_pages_count} processed)")
         print(f"⏱️ Total Time: {total_duration:.2f} seconds")
         print(f"⚡ Avg Time Per Page: {avg_per_page:.2f} seconds/page")
         print("-" * 50)
@@ -791,7 +733,7 @@ def process_massara_batch_pipeline(self, pdf_paths: list, batch_id: str):
                     pdf_name,
                     pdf_task_id,
                     batch_id,
-                    template="massara"
+                    template=template
                 ),
                 process_validation_task.s(
                     pdf_name,
@@ -801,24 +743,21 @@ def process_massara_batch_pipeline(self, pdf_paths: list, batch_id: str):
             ).apply_async(task_id=pdf_task_id)
         
         # Notify batch OCR complete
-        publish_update(batch_id, {
-            "batch_id": batch_id,
-            "status": "ocr_complete",
-            "processed_pdfs": len(pdf_results),
-            "total_pages": total_pages,
-            "total_time": total_duration,
-            "avg_time_per_page": avg_per_page,
-            "message": f"OCR complete for {len(pdf_results)} PDFs ({total_pages} pages) in {total_duration:.2f}s ({avg_per_page:.2f}s/page)"
-        })
+        send_task_update(batch_id, "ocr_complete", batch_id=batch_id,
+                         message=f"OCR complete for {len(pdf_results)} PDFs ({total_pages} pages, {ocr_pages_count} processed) in {total_duration:.2f}s ({avg_per_page:.2f}s/page)",
+                         data={
+                             "processed_pdfs": len(pdf_results),
+                             "total_pages": total_pages,
+                             "ocr_pages_count": ocr_pages_count,
+                             "total_time": total_duration,
+                             "avg_time_per_page": avg_per_page
+                         })
     
     try:
         asyncio.run(batch_orchestrator())
     except Exception as e:
-        publish_update(batch_id, {
-            "batch_id": batch_id,
-            "status": "error",
-            "message": f"Batch processing failed: {str(e)}"
-        })
+        send_task_update(batch_id, "error", batch_id=batch_id,
+                         message=f"Batch processing failed: {str(e)}")
         raise e
 
 
@@ -837,15 +776,16 @@ def process_gpt_extraction_from_file(self, interim_file: str, original_filename:
     text = ocr_data.get("joined_text", "")
     skipped_pages = ocr_data.get("skipped_pages", [])
     
-    # Collect image paths
-    interim_dir = os.path.dirname(interim_file)
-    image_paths = []
-    if os.path.exists(interim_dir):
-        for root, dirs, files in os.walk(interim_dir):
-            for file in files:
-                if file.lower().endswith(('.png', '.jpg', '.jpeg')):
-                    image_paths.append(os.path.join(root, file))
-        image_paths.sort()
+    image_paths = ocr_data.get("image_paths", [])
+    if not image_paths:
+        # Fallback collection if not explicitly passed
+        interim_dir = os.path.dirname(interim_file)
+        if os.path.exists(interim_dir):
+            for root, dirs, files in os.walk(interim_dir):
+                for file in files:
+                    if file.lower().endswith(('.png', '.jpg', '.jpeg')) and "_processed" in file:
+                        image_paths.append(os.path.join(root, file))
+            image_paths.sort()
     
     # Reuse existing GPT extraction logic
     ocr_result = {
@@ -857,4 +797,6 @@ def process_gpt_extraction_from_file(self, interim_file: str, original_filename:
     
     # Call existing GPT extraction task logic
     return process_gpt_extraction(ocr_result, original_filename, parent_task_id, batch_id, template)
+
+
 
